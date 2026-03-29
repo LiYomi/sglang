@@ -3171,11 +3171,7 @@ class ServerArgs:
         # hf_transformers_utils.py::get_config / get_tokenizer.
         _MISTRAL_NATIVE_CONFIG_PATTERNS = ("mistral-large-3", "mistral-small-4", "leanstral")
 
-        if os.path.isdir(self.model_path):
-            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
-            has_hf_config = os.path.exists(
-                os.path.join(self.model_path, "config.json")
-            )
+        def _check_format(has_params: bool, has_hf_config: bool) -> bool:
             if has_params and not has_hf_config:
                 return True
             if has_params and has_hf_config:
@@ -3183,6 +3179,14 @@ class ServerArgs:
                 if any(name in model_lower for name in _MISTRAL_NATIVE_CONFIG_PATTERNS):
                     return True
             return False
+
+        if os.path.isdir(self.model_path):
+            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
+            has_hf_config = os.path.exists(
+                os.path.join(self.model_path, "config.json")
+            )
+            return _check_format(has_params, has_hf_config)
+
         # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
@@ -3190,15 +3194,7 @@ class ServerArgs:
             files = {
                 s.rfilename for s in HfApi().model_info(self.model_path).siblings
             }
-            has_params = "params.json" in files
-            has_hf_config = "config.json" in files
-            if has_params and not has_hf_config:
-                return True
-            if has_params and has_hf_config:
-                model_lower = str(self.model_path).lower()
-                if any(name in model_lower for name in _MISTRAL_NATIVE_CONFIG_PATTERNS):
-                    return True
-            return False
+            return _check_format("params.json" in files, "config.json" in files)
         except Exception:
             return False
 
