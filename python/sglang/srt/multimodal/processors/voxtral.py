@@ -122,7 +122,8 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         messages = self._parse_mistral_prompt(input_text)
         try:
             input_ids = tokenizer.apply_chat_template(messages, tokenize=True)
-        except Exception:
+        except (ValueError, KeyError):
+            # Fallback if prompt parsing produces malformed messages
             input_ids = tokenizer.encode(input_text)
 
         # Insert audio tokens after the last [INST]
