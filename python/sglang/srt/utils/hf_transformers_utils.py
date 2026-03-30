@@ -840,14 +840,12 @@ def get_tokenizer(
         # MistralCommon tokenizers reject standard HF kwargs like
         # trust_remote_code, use_fast etc. Retry without them.
         if "are not supported by" in str(e) and "MistralCommon" in str(e):
-            retry_kwargs = {
-                k: v for k, v in kwargs.items()
-                if k not in {"trust_remote_code", "tokenizer_revision",
-                             "use_fast", "_from_auto",
-                             "clean_up_tokenization_spaces"}
-            }
+            for k in ("trust_remote_code", "tokenizer_revision",
+                      "use_fast", "_from_auto",
+                      "clean_up_tokenization_spaces"):
+                kwargs.pop(k, None)
             tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name, *args, **retry_kwargs,
+                tokenizer_name, *args, **kwargs,
             )
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
