@@ -8,13 +8,21 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.voxtral import VoxtralForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import load_audio
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
+)
 
 # Special token IDs for Voxtral audio (from tekken.json vocabulary)
 AUDIO_TOKEN_ID = 24  # [AUDIO]
 BEGIN_AUDIO_TOKEN_ID = 25  # [BEGIN_AUDIO]
 INST_TOKEN_ID = 3  # [INST]
+
+# Placeholder for load_mm_data regex matching.
+# encode("[AUDIO]") does NOT produce token 24; actual token insertion
+# is handled in _build_input_ids_with_audio.
+AUDIO_PLACEHOLDER = "[AUDIO]"
+AUDIO_PLACEHOLDER_REGEX = re.compile(r"\[AUDIO\]")
 
 
 class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
@@ -37,6 +45,12 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
             // getattr(audio_config, "hidden_size", 1280),
         )
 
+        self.mm_tokens = MultimodalSpecialTokens(
+            audio_token=AUDIO_PLACEHOLDER,
+            audio_token_regex=AUDIO_PLACEHOLDER_REGEX,
+            audio_token_id=self.audio_token_id,
+        ).build(_processor)
+
     def _compute_audio_token_count(self, n_samples: int) -> int:
         """Compute the number of [AUDIO] tokens for a given audio length."""
         mel_frames = n_samples / self.hop_length
@@ -56,12 +70,27 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         if not audio_data:
             return None
 
-        # Load audio waveforms
+        # Insert [AUDIO] placeholders into prompt for load_mm_data's regex
+        prompt_with_placeholders = self._insert_audio_placeholders(
+            input_text, len(audio_data)
+        )
+
+        # load_mm_data handles async loading, format detection, resampling.
+        # process_and_combine_mm_data cannot be used: HF VoxtralProcessor.__call__
+        # does not support audio (only apply_chat_template does).
+        base_output = self.load_mm_data(
+            prompt=prompt_with_placeholders,
+            audio_data=audio_data,
+            multimodal_tokens=self.mm_tokens,
+            audio_sample_rate=self.sampling_rate,
+        )
+        if base_output is None:
+            return None
+
+        # Convert loaded audio to tensors
         waveforms: List[torch.Tensor] = []
-        for audio in audio_data:
-            wav = load_audio(audio, self.sampling_rate)
-            if not isinstance(wav, torch.Tensor):
-                wav = torch.tensor(wav, dtype=torch.float32)
+        for audio in base_output.audios:
+            wav = torch.as_tensor(audio, dtype=torch.float32)
             if wav.dim() > 1:
                 wav = wav.mean(dim=0)
             waveforms.append(wav)
@@ -89,6 +118,17 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
             "mm_items": mm_items,
             "audio_token_id": self.audio_token_id,
         }
+
+    @staticmethod
+    def _insert_audio_placeholders(prompt: str, n_audio: int) -> str:
+        """Insert [AUDIO] placeholder texts into the prompt for load_mm_data."""
+        placeholders = AUDIO_PLACEHOLDER * n_audio
+        # Insert after the last [INST] marker if present
+        last_inst = prompt.rfind("[INST]")
+        if last_inst >= 0:
+            insert_pos = last_inst + len("[INST]")
+            return prompt[:insert_pos] + placeholders + prompt[insert_pos:]
+        return placeholders + prompt
 
     @staticmethod
     def _find_audio_offsets(input_ids: List[int], audio_token_id: int) -> List[tuple]:
