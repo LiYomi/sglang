@@ -9,7 +9,6 @@ from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 register_cuda_ci(
     est_time=200,
     suite="stage-b-test-1-gpu-small",
-    disabled="Temporarily disabled",
 )
 
 MODEL = "mistralai/Ministral-3-3B-Instruct-2512"
