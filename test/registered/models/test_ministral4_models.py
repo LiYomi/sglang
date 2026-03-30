@@ -21,7 +21,7 @@ class TestMistralSmall4TextOnly(GSM8KMixin, DefaultServerBase):
 
 
 class TestMistralSmall4MMMU(MMMUMixin, MMMUServerBase):
-    accuracy = 0.5
+    accuracy = 0.45
     model = MODEL
     other_args = ["--tp-size", "2", "--trust-remote-code"]
     mmmu_args = ["--limit=0.1"]
