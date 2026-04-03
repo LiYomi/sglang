@@ -34,9 +34,7 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         self.audio_token_id = getattr(hf_config, "audio_token_id", AUDIO_TOKEN_ID)
         self.sampling_rate = getattr(audio_config, "sampling_rate", 16000)
         self.hop_length = getattr(audio_config, "hop_length", 160)
-        self.max_source_positions = getattr(
-            audio_config, "max_source_positions", 1500
-        )
+        self.max_source_positions = getattr(audio_config, "max_source_positions", 1500)
         self.conv_downsample = 2  # conv1 stride=1 * conv2 stride=2
         self.downsample_factor = getattr(
             audio_config,
@@ -167,9 +165,7 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
             input_ids = tokenizer.encode(input_text)
 
         # Insert audio tokens after the last [INST]
-        inst_positions = [
-            i for i, t in enumerate(input_ids) if t == INST_TOKEN_ID
-        ]
+        inst_positions = [i for i, t in enumerate(input_ids) if t == INST_TOKEN_ID]
         insert_pos = (inst_positions[-1] + 1) if inst_positions else 1
 
         audio_tokens = []

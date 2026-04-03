@@ -154,12 +154,8 @@ class VoxtralWhisperEncoder(nn.Module):
         super().__init__()
         embed_dim = config.d_model
 
-        self.conv1 = nn.Conv1d(
-            config.num_mel_bins, embed_dim, kernel_size=3, padding=1
-        )
-        self.conv2 = nn.Conv1d(
-            embed_dim, embed_dim, kernel_size=3, stride=2, padding=1
-        )
+        self.conv1 = nn.Conv1d(config.num_mel_bins, embed_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
         self.embed_positions = nn.Embedding(config.max_source_positions, embed_dim)
         self.layers = nn.ModuleList(
             [
@@ -239,9 +235,7 @@ class VoxtralForConditionalGeneration(nn.Module):
         )
 
         # Language model
-        self.language_model = LlamaForCausalLM(
-            text_config, quant_config=quant_config
-        )
+        self.language_model = LlamaForCausalLM(text_config, quant_config=quant_config)
 
         # Mel filter bank for raw waveform -> mel spectrogram
         self._init_mel_filters(audio_config)
@@ -280,8 +274,7 @@ class VoxtralForConditionalGeneration(nn.Module):
     @property
     def _chunk_size(self) -> int:
         return (
-            self.config.audio_config.max_source_positions
-            * self._conv_downsample_factor
+            self.config.audio_config.max_source_positions * self._conv_downsample_factor
         )
 
     def _compute_mel_spectrogram(self, audio_waveform: torch.Tensor) -> torch.Tensor:
@@ -302,9 +295,7 @@ class VoxtralForConditionalGeneration(nn.Module):
         log_spec = (log_spec + 4.0) / 4.0
         return log_spec
 
-    def _encode_audio(
-        self, audio_waveforms: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
+    def _encode_audio(self, audio_waveforms: List[torch.Tensor]) -> List[torch.Tensor]:
         """Encode raw audio waveforms through mel spectrogram + whisper encoder."""
         dtype = self.audio_tower.conv1.weight.dtype
         device = self.audio_tower.conv1.weight.device
@@ -401,10 +392,7 @@ class VoxtralForConditionalGeneration(nn.Module):
         weights_list = list(weights)
         extra_weights = []
         for name, w in weights_list:
-            if (
-                name.startswith("audio_tower.")
-                and ".self_attn.k_proj.weight" in name
-            ):
+            if name.startswith("audio_tower.") and ".self_attn.k_proj.weight" in name:
                 bias_name = name.replace(".weight", ".bias")
                 if not any(n == bias_name for n, _ in weights_list):
                     extra_weights.append(
@@ -416,13 +404,11 @@ class VoxtralForConditionalGeneration(nn.Module):
             for name, w in weights_list:
                 # Encoder weights
                 if name.startswith("audio_tower."):
-                    trimmed = name[len("audio_tower."):]
+                    trimmed = name[len("audio_tower.") :]
                     loaded = False
                     for param_name, weight_name, shard_id in encoder_stacked:
                         if f".{weight_name}." in trimmed:
-                            stacked_name = trimmed.replace(
-                                weight_name, param_name
-                            )
+                            stacked_name = trimmed.replace(weight_name, param_name)
                             if stacked_name in encoder_dict:
                                 param = encoder_dict[stacked_name]
                                 param.weight_loader(param, w, shard_id)
@@ -438,10 +424,10 @@ class VoxtralForConditionalGeneration(nn.Module):
 
                 # Projector weights
                 if name.startswith("multi_modal_projector."):
-                    trimmed = name[len("multi_modal_projector."):]
-                    trimmed = trimmed.replace(
-                        "linear_1.", "w_in."
-                    ).replace("linear_2.", "w_out.")
+                    trimmed = name[len("multi_modal_projector.") :]
+                    trimmed = trimmed.replace("linear_1.", "w_in.").replace(
+                        "linear_2.", "w_out."
+                    )
                     if trimmed in projector_dict:
                         param = projector_dict[trimmed]
                         default_weight_loader(param, w)
@@ -449,7 +435,7 @@ class VoxtralForConditionalGeneration(nn.Module):
 
                 # LLM weights
                 if name.startswith("language_model."):
-                    name = name[len("language_model."):]
+                    name = name[len("language_model.") :]
                 yield (name, w)
 
         self.language_model.load_weights(llm_weights_generator())

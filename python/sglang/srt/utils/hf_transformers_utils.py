@@ -840,12 +840,18 @@ def get_tokenizer(
         # MistralCommon tokenizers reject standard HF kwargs like
         # trust_remote_code, use_fast etc. Retry without them.
         if "are not supported by" in str(e) and "MistralCommon" in str(e):
-            for k in ("trust_remote_code", "tokenizer_revision",
-                      "use_fast", "_from_auto",
-                      "clean_up_tokenization_spaces"):
+            for k in (
+                "trust_remote_code",
+                "tokenizer_revision",
+                "use_fast",
+                "_from_auto",
+                "clean_up_tokenization_spaces",
+            ):
                 kwargs.pop(k, None)
             tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name, *args, **kwargs,
+                tokenizer_name,
+                *args,
+                **kwargs,
             )
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
@@ -1278,7 +1284,9 @@ def get_processor(
                 revision=revision,
                 **kwargs,
             )
-        elif "are not supported by" in error_message and "MistralCommon" in error_message:
+        elif (
+            "are not supported by" in error_message and "MistralCommon" in error_message
+        ):
             logger.info(
                 "AutoProcessor for %s rejected standard kwargs, "
                 "retrying without trust_remote_code/use_fast",
@@ -1409,11 +1417,10 @@ def _patch_mistral_common_tokenizer(tokenizer):
             for k in keys:
                 kwargs.pop(k, None)
             return fn(*args, **kwargs)
+
         return wrapper
 
-    tokenizer.decode = _drop_kwargs(
-        tokenizer.decode, ["spaces_between_special_tokens"]
-    )
+    tokenizer.decode = _drop_kwargs(tokenizer.decode, ["spaces_between_special_tokens"])
     tokenizer.batch_decode = _drop_kwargs(
         tokenizer.batch_decode, ["spaces_between_special_tokens"]
     )
