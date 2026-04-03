@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    RegisterModelReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -435,6 +436,8 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.active_model_name = self.server_args.served_model_name or self.server_args.model_path
+        self._model_path_map = {self.active_model_name: self.server_args.model_path}
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
@@ -1205,6 +1208,7 @@ class Scheduler(
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
+                (RegisterModelReqInput, self.register_model),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
@@ -1292,6 +1296,9 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
+                # Check for deferred model switch
+                if hasattr(self, "_check_pending_switch"):
+                    self._check_pending_switch()
 
             # Update last_batch
             self.last_batch = batch
@@ -1696,6 +1703,11 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # ── Multi-model: check if model switch is needed ──
+        target = getattr(recv_req, "target_model", None)
+        logger.info(f"handle_generate_request: target_model={target}, active={self.active_model_name}")
+        if target and target != self.active_model_name:
+            self._do_model_switch_for_request(target)
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None

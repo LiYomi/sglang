@@ -1156,6 +1156,14 @@ class CudaGraphRunner:
         else:
             graph_key = self.bs
         self.graphs[graph_key].replay()
+        # DIAGNOSTIC: check output after replay
+        import logging as _log
+        _diag_out = self.output_buffers[graph_key]
+        if hasattr(_diag_out, 'next_token_logits') and _diag_out.next_token_logits is not None:
+            _lt = _diag_out.next_token_logits[:1]
+            _log.getLogger('sglang').info(f'DIAG replay output: ptr={_lt.data_ptr()}, shape={_lt.shape}, '
+                f'max={_lt.max().item():.4f}, min={_lt.min().item():.4f}, mean={_lt.mean().item():.4f}, '
+                f'has_nan={_lt.isnan().any().item()}, has_inf={_lt.isinf().any().item()}')
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):

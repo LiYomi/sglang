@@ -27,6 +27,7 @@ import zmq
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    UpdateTokenizerNotification,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -100,6 +101,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
 
     def init_tokenizer(self, server_args: ServerArgs):
+        self.tokenizers = {}  # model_path -> tokenizer
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -109,6 +111,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
+            self.tokenizers[server_args.model_path] = self.tokenizer
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
@@ -139,10 +142,37 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+            # Handle tokenizer update notification
+            if isinstance(recv_obj, UpdateTokenizerNotification):
+                self._handle_tokenizer_update(recv_obj)
+                continue
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
             self.soft_watchdog.feed()
+
+
+    def _handle_tokenizer_update(self, notif: UpdateTokenizerNotification):
+        """Update tokenizer after model switch. Cache in dict for reuse."""
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        import logging
+        logger = logging.getLogger(__name__)
+        path = notif.tokenizer_path
+        if path in self.tokenizers:
+            self.tokenizer = self.tokenizers[path]
+            logger.info(f"Detokenizer reused cached tokenizer: {path}")
+        else:
+            try:
+                tok = get_tokenizer(
+                    path,
+                    tokenizer_mode=notif.tokenizer_mode,
+                    trust_remote_code=notif.trust_remote_code,
+                )
+                self.tokenizers[path] = tok
+                self.tokenizer = tok
+                logger.info(f"Detokenizer loaded and cached tokenizer: {path}")
+            except Exception as e:
+                logger.error(f"Failed to update detokenizer tokenizer: {e}")
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool

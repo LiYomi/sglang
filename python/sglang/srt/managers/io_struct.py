@@ -219,6 +219,9 @@ class GenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
+    # Target model name for multi-model serving
+    target_model: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -733,6 +736,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+
+    # Target model name for multi-model serving
+    target_model: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -1954,3 +1960,29 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+
+# ── Model Hot-Switch ──
+
+@dataclass
+
+
+@dataclass
+class RegisterModelReqInput(BaseReq):
+    """Register a new model for multi-model serving."""
+    model_name: str
+    model_path: str
+
+
+@dataclass
+class RegisterModelReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class UpdateTokenizerNotification:
+    """Sent from scheduler to detokenizer to update tokenizer after model switch."""
+    tokenizer_path: str
+    tokenizer_mode: str = "auto"
+    trust_remote_code: bool = False

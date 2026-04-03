@@ -69,6 +69,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
+from sglang.srt.managers.model_registry import ModelRegistry
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -222,6 +223,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        # Init multi-model registry
+        self.init_model_registry()
 
     def init_model_config(self):
         server_args = self.server_args
@@ -443,6 +447,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
 
+    def init_model_registry(self):
+        """Initialize model registry and register the startup model."""
+        self.model_registry = ModelRegistry()
+        # Register the initial model with its tokenizer
+        model_name = self.served_model_name or self.model_path
+        self.model_registry.register(model_name, self.model_path, self.tokenizer)
+        logger.info(f"Model registry initialized with: {model_name}")
+
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -507,6 +519,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
+            # Multi-model: set tokenizer from registry for target model
+            target_model = getattr(obj, "target_model", None)
+            if target_model and hasattr(self, "model_registry") and self.model_registry.has(target_model):
+                target_tokenizer = self.model_registry.get_tokenizer(target_model)
+                if target_tokenizer is not None:
+                    self.tokenizer = target_tokenizer
+
             await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
@@ -973,6 +992,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                target_model=getattr(obj, "target_model", None),
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -2475,6 +2495,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         ):
             obj.priority = self.default_priority_value
 
+
+
+    def register_model_local(self, model_name: str, model_path: str) -> dict:
+        """Register a new model locally (tokenizer only, no GPU).
+
+        Creates tokenizer for the new model and registers in registry.
+        The model weights will be loaded on-demand when first requested.
+        """
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        try:
+            new_tokenizer = get_tokenizer(
+                model_path,
+                tokenizer_mode=self.server_args.tokenizer_mode,
+                trust_remote_code=self.server_args.trust_remote_code,
+            )
+            self.model_registry.register(model_name, model_path, new_tokenizer)
+            return {"success": True, "message": f"Model {model_name} registered"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
 class ServerStatus(Enum):
     Up = "Up"

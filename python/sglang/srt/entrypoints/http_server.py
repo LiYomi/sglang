@@ -129,6 +129,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
+    RegisterModelReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
@@ -1190,6 +1191,27 @@ async def resume_memory_occupation(
     except Exception as e:
         return _create_error_response(e)
 
+
+@app.api_route("/register_model", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def register_model(obj: RegisterModelReqInput, request: Request):
+    """Register a new model for multi-model serving."""
+    try:
+        result = await _global_state.tokenizer_manager.register_model(obj, request)
+        return ORJSONResponse(result)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/list_models", methods=["GET"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_models(request: Request):
+    """List all registered models."""
+    registry = _global_state.tokenizer_manager.model_registry
+    return ORJSONResponse({
+        "models": registry.list_models(),
+        "default": registry.default_model,
+    })
 
 @app.post("/weights_checker")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)

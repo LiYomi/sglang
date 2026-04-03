@@ -140,6 +140,21 @@ class ModelRunnerKVCacheMixin:
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
+        # Bump allocator: compute from managed buffer remaining space
+        if getattr(self, "bump_vram_manager", None) is not None:
+            bump = self.bump_vram_manager
+            num_layers = self.num_effective_layers
+            cell_size = self.get_cell_size_per_token(num_layers)
+            available_bytes = bump.get_available_bytes()
+            # Reserve space for alignment padding (256 bytes per tensor * 2 * num_layers)
+            alignment_overhead = 4096 * 2 * num_layers
+            max_tokens = (available_bytes - alignment_overhead) // cell_size
+            logger.info(
+                f"Bump: KV cache available={available_bytes/1024**2:.1f}MB, "
+                f"cell_size={cell_size}, max_tokens={max_tokens}"
+            )
+            return max_tokens
+
         post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -705,6 +720,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        bump_vram_manager=getattr(self, "bump_vram_manager", None),
                     )
 
         # Initialize token_to_kv_pool_allocator

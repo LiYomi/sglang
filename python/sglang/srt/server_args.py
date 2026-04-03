@@ -649,6 +649,7 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
+    enable_bump_allocator: bool = False
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
@@ -5550,6 +5551,11 @@ class ServerArgs:
             "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+        )
+        parser.add_argument(
+            "--enable-bump-allocator",
+            action="store_true",
+            help="Use bump allocator for self-managed VRAM (model hot-switching)",
         )
         parser.add_argument(
             "--enable-weights-cpu-backup",

@@ -211,6 +211,51 @@ class SchedulerUpdateWeightsMixin:
         )
 
 
+    def _do_model_switch_for_request(self: "Scheduler", target_model_name: str):
+        if not hasattr(self, "_model_path_map"):
+            self._model_path_map = {}
+        target_path = self._model_path_map.get(target_model_name)
+        if not target_path:
+            logger.warning(f"Model not in path map: {target_model_name}")
+            return
+        if not self.is_fully_idle():
+            self._pending_switch = (target_model_name, target_path)
+            logger.info(f"Switch deferred (not idle): {self.active_model_name} -> {target_model_name}")
+            return
+        self._execute_model_switch(target_model_name, target_path)
+
+    def _execute_model_switch(self, target_model_name, target_path):
+        from sglang.srt.managers.multi_model_manager import do_model_switch
+        bump = getattr(self.tp_worker.model_runner, "bump_vram_manager", None)
+        if bump is not None:
+            from sglang.srt.managers.multi_model_manager import do_model_switch_bump
+            do_model_switch = do_model_switch_bump
+        logger.info(f"Auto-switching: {self.active_model_name} -> {target_model_name}")
+        try:
+            timings = do_model_switch(self, target_path, target_model_name)
+            self.active_model_name = target_model_name
+            logger.info(f"Auto-switch done in {timings.get('total', '?')}s")
+        except Exception as e:
+            logger.error(f"Auto-switch failed: {e}", exc_info=True)
+        finally:
+            self._pending_switch = None
+
+    def _check_pending_switch(self):
+        pending = getattr(self, "_pending_switch", None)
+        if pending is not None and self.is_fully_idle():
+            name, path = pending
+            self._execute_model_switch(name, path)
+
+    def register_model(self: "Scheduler", recv_req):
+        """Register a model name -> path mapping in scheduler."""
+        from sglang.srt.managers.io_struct import RegisterModelReqOutput
+
+        if not hasattr(self, '_model_path_map'):
+            self._model_path_map = {}
+
+        self._model_path_map[recv_req.model_name] = recv_req.model_path
+        logger.info(f"Scheduler registered model: {recv_req.model_name} -> {recv_req.model_path}")
+        return RegisterModelReqOutput(success=True, message=f"Registered {recv_req.model_name}")
 def _export_static_state(model):
     return dict(
         buffers=[
