@@ -973,21 +973,22 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
-        torch.cuda.synchronize()
+        h2d_stream = torch.cuda.Stream()
         chunk_size = self.cpu_offloading_chunk_size
-        for layer_id in range(self.layer_num):
-            for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
-                k_cpu, v_cpu = (
-                    kv_cache_cpu[layer_id][i // chunk_size][0],
-                    kv_cache_cpu[layer_id][i // chunk_size][1],
-                )
-                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
-                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
-                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
-                self.k_buffer[layer_id][chunk_indices] = k_chunk
-                self.v_buffer[layer_id][chunk_indices] = v_chunk
-        torch.cuda.synchronize()
+        with torch.cuda.stream(h2d_stream):
+            for layer_id in range(self.layer_num):
+                for i in range(0, len(indices), chunk_size):
+                    chunk_indices = indices[i : i + chunk_size]
+                    k_cpu, v_cpu = (
+                        kv_cache_cpu[layer_id][i // chunk_size][0],
+                        kv_cache_cpu[layer_id][i // chunk_size][1],
+                    )
+                    k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
+                    v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
+                    self.k_buffer[layer_id][chunk_indices] = k_chunk
+                    self.v_buffer[layer_id][chunk_indices] = v_chunk
+        h2d_stream.synchronize()
+
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing

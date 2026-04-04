@@ -221,6 +221,8 @@ class SchedulerUpdateWeightsMixin:
         if not self.is_fully_idle():
             self._pending_switch = (target_model_name, target_path)
             logger.info(f"Switch deferred (not idle): {self.active_model_name} -> {target_model_name}")
+            # Start preloading B weights to GPU staging while A is still serving
+            self._start_weight_preload(target_model_name)
             return
         self._execute_model_switch(target_model_name, target_path)
 
@@ -268,6 +270,68 @@ class SchedulerUpdateWeightsMixin:
         )
 
         return RegisterModelReqOutput(success=True, message=f"Registered {recv_req.model_name}")
+
+
+    def _start_weight_preload(self: "Scheduler", target_model_name: str):
+        """Start background H2D of target model weights to GPU staging.
+
+        Staging grows from right_offset leftward (before runtime).
+        """
+        logger.info(f"_start_weight_preload called: {target_model_name}")
+        bump = getattr(self.tp_worker.model_runner, "bump_vram_manager", None)
+        if bump is None:
+            return
+
+        if not hasattr(self, '_model_registry') or self._model_registry is None:
+            return
+        cpu_model, _ = self._model_registry.get_cpu_model(target_model_name)
+        if cpu_model is None:
+            return
+
+        # Build state dict including buffers
+        cpu_state_dict = {k: v.contiguous() for k, v in cpu_model.state_dict().items()}
+        for bname, buf in cpu_model.named_buffers():
+            if buf is not None and buf.numel() > 0 and bname not in cpu_state_dict:
+                cpu_state_dict[bname] = buf.contiguous()
+
+        from sglang.srt.mem_cache.preload_manager import PreloadManager
+        if not hasattr(self, '_preload_manager'):
+            self._preload_manager = PreloadManager()
+
+        self._preload_manager.start_preload(
+            model_name=target_model_name,
+            cpu_state_dict=cpu_state_dict,
+            bump=bump,
+            staging_offset=0,  # ignored, PreloadManager uses right_ptr
+            staging_capacity=0,  # ignored
+        )
+
+        # KV staging: if we have offloaded KV data for the target model,
+        # stage it to bump buffer (left of weight staging) for D2D restore on switch
+        kv_offload_mgr = getattr(self, '_kv_offload_mgr', None)
+        if kv_offload_mgr is not None and kv_offload_mgr.has_data(target_model_name):
+            kv_offload_mgr.wait_offload()
+            # Gather pending requests' token_ids for prefix matching
+            pending_token_ids = None
+            if hasattr(self, 'waiting_queue') and self.waiting_queue:
+                pending_token_ids = [
+                    list(req.origin_input_ids) for req in self.waiting_queue
+                ]
+            hit_entries = kv_offload_mgr.get_hit_entries(
+                target_model_name, pending_token_ids
+            )
+            if hit_entries:
+                self._preload_manager.start_kv_preload(
+                    model_name=target_model_name,
+                    hit_entries=hit_entries,
+                    bump=bump,
+                )
+                logger.info(
+                    f"KV staging triggered: {len(hit_entries)} entries, "
+                    f"{kv_offload_mgr.get_total_bytes(hit_entries) / 1024:.1f}KB"
+                )
+
+
 def _export_static_state(model):
     return dict(
         buffers=[

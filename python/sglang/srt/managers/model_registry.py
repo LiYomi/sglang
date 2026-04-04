@@ -126,21 +126,11 @@ class ModelRegistry:
             return info.cpu_model, info.cpu_model_config
         return None, None
 
-    def resolve(self, name: Optional[str]) -> str:
-        if name and name in self._models:
-            return name
-        if self.default_model:
-            return self.default_model
-        raise ValueError("No model registered")
-
     def has(self, name: str) -> bool:
         return name in self._models
 
     def list_models(self) -> List[str]:
         return list(self._models.keys())
-
-    def get_path(self, name: str) -> str:
-        return self.get(name).path
 
     def get_tokenizer(self, name: str) -> Any:
         return self.get(name).tokenizer

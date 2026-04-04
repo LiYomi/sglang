@@ -460,6 +460,23 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
+                    # KV offload: backup to CPU before tree insert (for model hot-switch)
+                    _kv_offload = getattr(self, '_kv_offload_mgr', None)
+                    if _kv_offload is not None:
+                        _kv_committed = req.kv_committed_len
+                        if _kv_committed > 0 and req.req_pool_idx is not None:
+                            _token_ids = (req.origin_input_ids + req.output_ids)[:_kv_committed]
+                            _slot_indices = self.tree_cache.req_to_token_pool.req_to_token[
+                                req.req_pool_idx, :_kv_committed
+                            ]
+                            _runner = self.tp_worker.model_runner
+                            _kv_offload.offload(
+                                model_name=getattr(self, 'active_model_name', ''),
+                                token_ids=_token_ids,
+                                slot_indices=_slot_indices,
+                                kv_pool=_runner.token_to_kv_pool,
+                                num_layers=_runner.num_effective_layers,
+                            )
                     if self.enable_hisparse:
                         self.hisparse_coordinator.request_finished(req)
                     release_kv_cache(req, self.tree_cache)

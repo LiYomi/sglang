@@ -188,7 +188,7 @@ from sglang.srt.utils.patch_torch import (
     register_sgl_tp_rank,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.mem_cache.bump_vram_manager import BumpVRAMManager
+from sglang.srt.mem_cache.bump_vram_manager import PageBumpManager
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -471,9 +471,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.enable_bump_allocator:
             from sglang.srt.utils.common import get_available_gpu_memory
             avail_gb = get_available_gpu_memory(self.device, self.gpu_id)
-            reserve_gb = 4.5  # graph pool + CUDA context + PyTorch allocator headroom
-            managed_bytes = int((avail_gb - reserve_gb) * 1024**3)
-            self.bump_vram_manager = BumpVRAMManager(managed_bytes, self.device)
+            fraction = getattr(self.server_args, "mem_fraction_bump", 0.95)
+            managed_bytes = int(avail_gb * fraction * 1024**3)
+            logger.info(f"Bump: avail={avail_gb:.1f}GB, fraction={fraction}, managed={managed_bytes/1024**3:.2f}GB")
+
+
+            self.bump_vram_manager = PageBumpManager(managed_bytes, self.device)
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
@@ -1080,6 +1083,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
 
         bump = self.bump_vram_manager
+        bump._current_model = self.server_args.served_model_name
 
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
@@ -1122,15 +1126,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             bump.allocate_region("weights", total_bytes)
 
-        # Phase 4: Migrate parameters CPU -> bump (H2D transfer)
+        # Phase 4: Migrate parameters CPU -> bump (H2D on separate stream for overlap)
+        h2d_stream = torch.cuda.Stream()
+        self._h2d_done_event = torch.cuda.Event()  # H2D transfer done
         for name, p in self.model.named_parameters():
             parts = name.split(".")
             module = self.model
             for part in parts[:-1]:
                 module = getattr(module, part)
             attr_name = parts[-1]
-            managed = bump.create_tensor("weights", p.shape, p.dtype)
-            managed.copy_(p.data)
+            managed = bump.create_tensor("weights", p.shape, p.dtype, name=name)
+            with torch.cuda.stream(h2d_stream):
+                managed.copy_(p.data, non_blocking=True)
             new_param = torch.nn.Parameter(managed, requires_grad=False)
             for k, v in p.__dict__.items():
                 if k not in new_param.__dict__:
@@ -1141,8 +1148,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         cpu_buffers = [(n, b) for n, b in self.model.named_buffers()
                        if b is not None and b.numel() > 0]
         for buf_name, buf in cpu_buffers:
-            managed = bump.create_tensor("weights", buf.shape, buf.dtype)
-            managed.copy_(buf.data)
+            managed = bump.create_tensor("weights", buf.shape, buf.dtype, name=buf_name)
+            with torch.cuda.stream(h2d_stream):
+                managed.copy_(buf.data, non_blocking=True)
             parts = buf_name.split(".")
             module = self.model
             for part in parts[:-1]:
@@ -1152,11 +1160,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(f"Bump: {len(cpu_buffers)} buffers migrated")
 
         wt = "weights"
+        h2d_stream.record_event(self._h2d_done_event)
+        h2d_stream.synchronize()
         logger.info(f"Bump: weights migrated, used {bump.regions[wt].used_bytes / 1024**2:.1f} MB")
 
-    def _load_model_bump_from_cpu(self, cpu_model):
+    def _load_model_bump_from_cpu(self, cpu_model, staging_info=None):
         """Load model from preloaded CPU model into bump buffer. Skips disk I/O."""
         bump = self.bump_vram_manager
+        bump._current_model = self.server_args.served_model_name
         self.model = cpu_model
         self.model.eval()
         logger.info("Bump: using preloaded CPU model (skipped disk I/O)")
@@ -1175,15 +1186,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             bump.allocate_region("weights", total_bytes)
 
+
         # Phase 4: Migrate parameters CPU -> bump
+        # Use two streams in parallel: D2D for staged params, H2D for unstaged
+        d2d_stream = torch.cuda.Stream()
+        h2d_stream = torch.cuda.Stream()
+        self._h2d_done_event = torch.cuda.Event()
+        d2d_count = 0
+        h2d_count = 0
         for name, p in self.model.named_parameters():
             parts = name.split(".")
             module = self.model
             for part in parts[:-1]:
                 module = getattr(module, part)
             attr_name = parts[-1]
-            managed = bump.create_tensor("weights", p.shape, p.dtype)
-            managed.copy_(p.data)
+            managed = bump.create_tensor("weights", p.shape, p.dtype, name=name)
+            _staged = staging_info.get(name) if staging_info else None
+            if _staged and _staged.status == "staged":
+                # D2D from staging area (GPU -> GPU, ~2.9 TB/s)
+                with torch.cuda.stream(d2d_stream):
+                    src = bump.buffer[_staged.staging_offset : _staged.staging_offset + _staged.nbytes]
+                    dst_bytes = managed.nelement() * managed.element_size()
+                    managed.view(-1).view(torch.uint8)[:dst_bytes].copy_(src[:dst_bytes], non_blocking=True)
+                d2d_count += 1
+            else:
+                # H2D from CPU (CPU -> GPU, ~55 GB/s)
+                with torch.cuda.stream(h2d_stream):
+                    managed.copy_(p.data, non_blocking=True)
+                h2d_count += 1
+                logger.info(f"  H2D fallback: {name} (not in staging)")
             new_param = torch.nn.Parameter(managed, requires_grad=False)
             for k, v in p.__dict__.items():
                 if k not in new_param.__dict__:
@@ -1194,8 +1225,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         cpu_buffers = [(n, b) for n, b in self.model.named_buffers()
                        if b is not None and b.numel() > 0]
         for buf_name, buf in cpu_buffers:
-            managed = bump.create_tensor("weights", buf.shape, buf.dtype)
-            managed.copy_(buf.data)
+            managed = bump.create_tensor("weights", buf.shape, buf.dtype, name=buf_name)
+            _staged = staging_info.get(buf_name) if staging_info else None
+            if _staged and _staged.status == "staged":
+                with torch.cuda.stream(d2d_stream):
+                    src = bump.buffer[_staged.staging_offset : _staged.staging_offset + _staged.nbytes]
+                    dst_bytes = managed.nelement() * managed.element_size()
+                    managed.view(-1).view(torch.uint8)[:dst_bytes].copy_(src[:dst_bytes], non_blocking=True)
+                d2d_count += 1
+            else:
+                with torch.cuda.stream(h2d_stream):
+                    managed.copy_(buf.data, non_blocking=True)
+                h2d_count += 1
+                logger.info(f"  H2D fallback: {buf_name} (not in staging)")
             parts = buf_name.split(".")
             module = self.model
             for part in parts[:-1]:
@@ -1203,9 +1245,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             module._buffers[parts[-1]] = managed
         if cpu_buffers:
             logger.info(f"Bump: {len(cpu_buffers)} buffers migrated")
-
-        wt = "weights"
-        logger.info(f"Bump: weights migrated from preload, used {bump.regions[wt].used_bytes / 1024**2:.1f} MB")
+        # Wait for both streams
+        d2d_stream.synchronize()
+        h2d_stream.record_event(self._h2d_done_event)
+        h2d_stream.synchronize()
+        logger.info(f"Bump: weights migrated (D2D: {d2d_count}, H2D: {h2d_count}), "
+                    f"used {bump.regions['weights'].used_bytes / 1024**2:.1f} MB")
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -2070,6 +2115,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _init_runtime_region(self):
         """Allocate bump 'runtime' region for workspace + DecodeInputBuffers."""
         bump = self.bump_vram_manager
+        bump._current_model = self.server_args.served_model_name
         if bump is None:
             return
         # Workspace: determined by model architecture (same logic as FlashInfer backend)
@@ -2950,7 +2996,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device == "cpu"
             else forward_batch.forward_mode.is_cuda_graph
         )
+        # Skip CUDA graph during layer swap (need per-layer hooks)
         can_run_graph = bool(
+            not getattr(self, "_layer_swap_ctx", None)
+            and
             mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)

@@ -393,6 +393,23 @@ class Scheduler(
         # Init running status
         self.init_running_status()
 
+        # Auto-register initial model for CPU preload (after all init done)
+        bump_enabled = getattr(self.server_args, "enable_bump_allocator", False)
+        if bump_enabled:
+            from sglang.srt.managers.model_registry import ModelRegistry
+            if not hasattr(self, "_model_registry"):
+                self._model_registry = ModelRegistry()
+            self._model_registry.register(
+                self.active_model_name, self.server_args.model_path,
+                tokenizer=None, preload=True,
+            )
+            logger.info(f"Model registry initialized with: {self.active_model_name}")
+
+            # Init KV offload manager for continuous D2H backup
+            from sglang.srt.mem_cache.kv_offload_manager import KVOffloadManager
+            self._kv_offload_mgr = KVOffloadManager()
+            logger.info("KV offload manager initialized")
+
         # Init chunked prefill
         self.init_chunked_prefill()
 

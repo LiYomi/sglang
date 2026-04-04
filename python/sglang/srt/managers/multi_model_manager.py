@@ -1,8 +1,5 @@
 """
-Multi-model management: model switching logic.
-
-Phase 1 MVP: switch by model_path.
-Memory strategy: direct free (no VMM dependency).
+Multi-model manager: model hot-switching with D2D staging + bump allocator.
 """
 
 from __future__ import annotations
@@ -59,46 +56,6 @@ def _save_kv_snapshot(tree_cache, allocator, model_name):
         logger.warning(f"  KV snapshot save failed: {e}")
 
 
-def _restore_kv_snapshot(tree_cache, allocator, model_name):
-    """Restore radix tree state + KV cache data from CPU after model switch."""
-    if model_name not in _kv_snapshots:
-        return False
-
-    inner = getattr(tree_cache, 'inner', tree_cache)
-    saved_state, saved_indices_cpu, kv_data_cpu = _kv_snapshots[model_name]
-
-    try:
-        saved_indices = saved_indices_cpu.to(allocator.device)
-        pool = allocator.get_kvcache()
-        pool.load_cpu_copy(kv_data_cpu, saved_indices)
-
-        # Restore tree state
-        inner.root_node = saved_state['root_node']
-        inner.evictable_size_ = saved_state['evictable_size']
-        inner.protected_size_ = saved_state['protected_size']
-        inner.evictable_leaves = saved_state['evictable_leaves']
-
-        # Remove restored indices from allocator free list
-        used_set = set(saved_indices.tolist())
-        free_list = allocator.free_pages.tolist()
-        new_free = [p for p in free_list if p not in used_set]
-        allocator.free_pages = torch.tensor(new_free, dtype=allocator.free_pages.dtype,
-                                            device=allocator.free_pages.device)
-
-        logger.info(f"  KV restore debug: saved_indices={len(saved_indices)}, "
-                    f"evictable_after={inner.evictable_size_}, "
-                    f"free_slots_before={len(allocator.free_pages) + len(used_set)}, "
-                    f"free_slots_after={len(new_free)}, "
-                    f"available_after={allocator.available_size()}")
-        del _kv_snapshots[model_name]
-        logger.info(f"  KV snapshot restored: {len(saved_indices)} tokens for {model_name}")
-        return True
-    except Exception as e:
-        logger.warning(f"  KV snapshot restore failed: {e}")
-        if model_name in _kv_snapshots:
-            del _kv_snapshots[model_name]
-        return False
-
 
 def _get_graph_pool():
     from sglang.srt.model_executor.cuda_graph_runner import get_global_graph_memory_pool
@@ -107,6 +64,11 @@ def _get_graph_pool():
 def _set_graph_pool(pool):
     from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
     set_global_graph_memory_pool(pool)
+
+
+_kv_pool_cache = {}
+_model_cache = {}
+_runtime_cache = {}  # model_name -> runtime region capacity  # model_name → runner.model (nn.Module with bump-pointed params)
 
 def _save_graph_cache(runner, model_name):
     """Cache CUDA graph runner + attn_backend for later restoration."""
@@ -128,23 +90,7 @@ def _save_graph_cache(runner, model_name):
             'graph_pool_handle': _get_graph_pool(),  # pool id logged below
             'model_buffers': saved_buffers,
         }
-        # Diagnostic: log key tensor addresses
-        addrs = {}
-        if hasattr(runner, 'attn_backend'):
-            ab = runner.attn_backend
-            addrs['workspace'] = ab.workspace_buffer.data_ptr() if hasattr(ab, 'workspace_buffer') else 'N/A'
-            if hasattr(ab, 'cuda_graph_kv_indices') and ab.cuda_graph_kv_indices:
-                addrs['kv_indices'] = ab.cuda_graph_kv_indices[0].data_ptr()
-            if hasattr(ab, 'kv_indptr') and ab.kv_indptr:
-                addrs['kv_indptr'] = ab.kv_indptr[0].data_ptr()
-        if hasattr(runner, 'model'):
-            for n, b in runner.model.named_buffers():
-                if 'cos_sin' in n or 'inv_freq' in n:
-                    addrs[n] = b.data_ptr()
-                    break
-        for n, p in list(runner.model.named_parameters())[:1]:
-            addrs[f'param:{n}'] = p.data_ptr()
-        addrs['pool_handle'] = id(_get_graph_pool()) if _get_graph_pool() else 'None'; logger.info(f"  Graph cache saved for {model_name}, addrs={addrs}")
+        logger.info(f"  Graph cache saved for {model_name}")
     except Exception as e:
         logger.warning(f"  Graph cache save failed: {e}")
 
@@ -181,68 +127,139 @@ def _restore_graph_cache(runner, model_name):
         _forward_input_buffer_pool.clear()
         _forward_input_buffer_pool.update(cached['input_buffer_pool'])
 
-        # DIAGNOSTIC: check buffer data before restore
-        _saved_bufs = cached.get('model_buffers', {})
-        for _bn, _sb in _saved_bufs.items():
-            if 'cos_sin' in _bn:
-                logger.info(f"  DIAG {_bn}: saved_ptr={_sb.data_ptr()}, data[:4]={_sb.flatten()[:4].tolist()}")
-                _parts = _bn.split(".")
-                _mod = runner.model
-                try:
-                    for _p in _parts[:-1]:
-                        _mod = getattr(_mod, _p)
-                    _nb = _mod._buffers.get(_parts[-1])
-                    if _nb is not None:
-                        logger.info(f"  DIAG {_bn}: new_ptr={_nb.data_ptr()}, data[:4]={_nb.flatten()[:4].tolist()}, same_ptr={_sb.data_ptr()==_nb.data_ptr()}")
-                except Exception as _e:
-                    logger.info(f"  DIAG {_bn}: new buf lookup failed: {_e}")
-
-        # Restore model buffers to original addresses (cos_sin_cache etc.)
-        # Key: the saved tensor's GPU address was overwritten during model switch.
-        # We must copy the freshly computed buffer data to the saved address,
-        # then replace the model's reference to point to the saved address.
+        # Restore model buffers - skip copy if model cache hit (same addresses)
+        _is_model_cached = model_name in _model_cache
         saved_buffers = cached.get('model_buffers', {})
         if saved_buffers and hasattr(runner, 'model') and runner.model is not None:
-            for buf_name, saved_buf in saved_buffers.items():
-                parts = buf_name.split(".")
-                module = runner.model
-                try:
-                    for part in parts[:-1]:
-                        module = getattr(module, part)
-                    # Get the new model's freshly computed buffer (correct data, new address)
-                    new_buf = module._buffers.get(parts[-1])
-                    if new_buf is not None and new_buf.shape == saved_buf.shape and new_buf.dtype == saved_buf.dtype:
-                        # Copy correct data to the saved address (where graph expects it)
-                        saved_buf.copy_(new_buf)
-                    # Replace model reference to use saved address
-                    module._buffers[parts[-1]] = saved_buf
-                except (AttributeError, KeyError):
-                    pass
+            if _is_model_cached:
+                # Model cache hit: buffer addresses unchanged, D2D already restored data
+                # Just ensure model refs point to saved (graph-known) addresses
+                for buf_name, saved_buf in saved_buffers.items():
+                    parts = buf_name.split(".")
+                    module = runner.model
+                    try:
+                        for part in parts[:-1]:
+                            module = getattr(module, part)
+                        module._buffers[parts[-1]] = saved_buf
+                    except (AttributeError, KeyError):
+                        pass
+            else:
+                for buf_name, saved_buf in saved_buffers.items():
+                    parts = buf_name.split(".")
+                    module = runner.model
+                    try:
+                        for part in parts[:-1]:
+                            module = getattr(module, part)
+                        new_buf = module._buffers.get(parts[-1])
+                        if new_buf is not None and new_buf.shape == saved_buf.shape and new_buf.dtype == saved_buf.dtype:
+                            saved_buf.copy_(new_buf)
+                        module._buffers[parts[-1]] = saved_buf
+                    except (AttributeError, KeyError):
+                        pass
 
         del _graph_cache[model_name]
         # Diagnostic: log key tensor addresses after restore
-        addrs = {}
-        if hasattr(runner, 'attn_backend'):
-            ab = runner.attn_backend
-            addrs['workspace'] = ab.workspace_buffer.data_ptr() if hasattr(ab, 'workspace_buffer') else 'N/A'
-            if hasattr(ab, 'cuda_graph_kv_indices') and ab.cuda_graph_kv_indices:
-                addrs['kv_indices'] = ab.cuda_graph_kv_indices[0].data_ptr()
-            if hasattr(ab, 'kv_indptr') and ab.kv_indptr:
-                addrs['kv_indptr'] = ab.kv_indptr[0].data_ptr()
-        if hasattr(runner, 'model'):
-            for n, b in runner.model.named_buffers():
-                if 'cos_sin' in n or 'inv_freq' in n:
-                    addrs[n] = b.data_ptr()
-                    break
-        for n, p in list(runner.model.named_parameters())[:1]:
-            addrs[f'param:{n}'] = p.data_ptr()
-        addrs['pool_handle'] = id(_get_graph_pool()) if _get_graph_pool() else 'None'; logger.info(f"  Graph cache restored for {model_name}, addrs={addrs}")
+        logger.info(f"  Graph cache restored for {model_name}")
         return True
     except Exception as e:
         logger.warning(f"  Graph cache restore failed: {e}")
         if model_name in _graph_cache:
             del _graph_cache[model_name]
         return False
+
+
+
+def _restore_kv_from_staging(runner, preload_mgr, bump, scheduler):
+    """D2D KV staging data to KV pool slots, then insert into radix tree."""
+    from sglang.srt.mem_cache.preload_manager import StagedKVEntry
+    
+    if not hasattr(preload_mgr, 'kv_staged') or not preload_mgr.kv_staged:
+        return
+    
+    preload_mgr.wait_complete()
+    
+    tree_cache = scheduler.tree_cache
+    allocator = runner.token_to_kv_pool_allocator
+    kv_pool = runner.token_to_kv_pool
+    num_layers = runner.num_effective_layers
+    
+    total_restored = 0
+    total_tokens = 0
+    
+    for idx, staged_entry in preload_mgr.kv_staged.items():
+        if staged_entry.status != "staged":
+            continue
+        
+        n_tokens = staged_entry.num_tokens
+        
+        # Allocate new slots in KV pool
+        if allocator.available_size() < n_tokens:
+            logger.info(f"  KV restore: not enough slots ({allocator.available_size()} < {n_tokens}), skipping")
+            continue
+        
+        new_slots = allocator.alloc(n_tokens)
+        if new_slots is None:
+            logger.info(f"  KV restore: alloc failed for {n_tokens} tokens")
+            continue
+        
+        # D2D: staging buffer -> KV pool k_buffer/v_buffer
+        d2d_stream = torch.cuda.Stream()
+        with torch.cuda.stream(d2d_stream):
+            for layer_id, (k_off, k_bytes, v_off, v_bytes) in enumerate(staged_entry.layer_data_offsets):
+                # Reshape staging data to match KV buffer shape
+                k_buf = kv_pool.k_buffer[layer_id]
+                v_buf = kv_pool.v_buffer[layer_id]
+                
+                # k_buf[slot] shape: [num_heads, head_dim]
+                k_slot_bytes = k_buf[0].numel() * k_buf[0].element_size()
+                v_slot_bytes = v_buf[0].numel() * v_buf[0].element_size()
+                
+                # Copy each token's k data from staging to new slot
+                staging_k = bump.buffer[k_off : k_off + k_bytes]
+                staging_v = bump.buffer[v_off : v_off + v_bytes]
+                
+                # Reshape and scatter to new slots
+                k_shaped = staging_k.view(n_tokens, -1)
+                v_shaped = staging_v.view(n_tokens, -1)
+                
+                k_buf_flat = k_buf.view(k_buf.shape[0], -1)
+                v_buf_flat = v_buf.view(v_buf.shape[0], -1)
+                
+                k_buf_flat[new_slots] = k_shaped
+                v_buf_flat[new_slots] = v_shaped
+        
+        d2d_stream.synchronize()
+        
+        # Insert into radix tree
+        token_ids = staged_entry.token_ids.tolist()
+        inner = getattr(tree_cache, 'inner', tree_cache)
+        if not inner.disable:
+            from sglang.srt.mem_cache.radix_cache import RadixKey, InsertParams
+            page_size = getattr(inner, 'page_size', 1)
+            # page_align_keys: truncate to page boundary
+            from sglang.srt.mem_cache.radix_cache import page_align_keys
+            keys = page_align_keys(token_ids, page_size)
+            values = new_slots[:len(keys)].to(dtype=torch.int64)
+            radix_key = RadixKey(keys, None, is_bigram=False)
+            try:
+                inner.insert(InsertParams(key=radix_key, value=values, priority=0))
+                # Free excess slots beyond page-aligned length
+                if len(keys) < n_tokens:
+                    allocator.free(new_slots[len(keys):])
+            except Exception as e:
+                logger.warning(f"  KV restore: radix insert failed: {e}")
+                allocator.free(new_slots)
+                continue
+        
+        total_restored += 1
+        total_tokens += n_tokens
+    
+    # Clear staged KV data
+    preload_mgr.kv_staged.clear()
+    preload_mgr.kv_staging_bytes = 0
+    
+    if total_restored > 0:
+        logger.info(f"  KV staging restored: {total_restored} entries, {total_tokens} tokens")
 
 
 def do_model_switch(scheduler: "Scheduler", target_model_path: str, target_model_name: str = None) -> dict:
@@ -343,7 +360,7 @@ def do_model_switch(scheduler: "Scheduler", target_model_path: str, target_model
     runner.kv_cache_dtype = new_config.dtype  # Phase 1: match model dtype
 
     timings["load"] = time.perf_counter() - t0
-    logger.info(f"  load: {timings["load"]:.3f}s  GPU: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    logger.debug(f"  load: {timings["load"]:.3f}s  GPU: {torch.cuda.memory_allocated()/1e9:.2f}GB")
 
     # ── 3. Reinit KV pool + attention ──
     t0 = time.perf_counter()
@@ -422,101 +439,242 @@ def do_model_switch(scheduler: "Scheduler", target_model_path: str, target_model
 
     return timings
 
+
 def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
-    import time
+    """Switch model without releasing bump regions. D2D staging + in-place overwrite."""
     runner = scheduler.tp_worker.model_runner
     bump = runner.bump_vram_manager
     timings = {}
     t_total = time.perf_counter()
+    current_model_name = getattr(scheduler, 'active_model_name', None)
     logger.info(f'Bump switch: {scheduler.server_args.model_path} -> {target_model_path}')
 
-
-    # Save KV cache + graph cache before release
-    current_model_name = getattr(scheduler, 'active_model_name', None)
-    if current_model_name and hasattr(scheduler, 'tree_cache') and scheduler.token_to_kv_pool_allocator is not None:
-        _save_kv_snapshot(scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, current_model_name)
+    t_p1 = time.perf_counter()
+    # === Phase 1: Save caches ===
     if current_model_name:
-        _save_graph_cache(runner, current_model_name)
-        # VMM: release physical pages of old model's graph pool
+        if current_model_name not in _graph_cache:
+            _save_graph_cache(runner, current_model_name)
+        # Save KV pool cache for fast switch-back
+        kv_r = bump.regions.get("kv_cache")
+        if kv_r:
+            _w = bump.regions.get("weights")
+            _kv_pool_cache[current_model_name] = {
+                "req_to_token_pool": runner.req_to_token_pool,
+                "token_to_kv_pool": runner.token_to_kv_pool,
+                "token_to_kv_pool_allocator": runner.token_to_kv_pool_allocator,
+                "max_total_num_tokens": runner.max_total_num_tokens,
+                "max_running_requests": runner.max_running_requests,
+                "weight_bytes": _w.capacity if _w else 0,
+                "kv_region_capacity": kv_r.capacity,
+            }
+            logger.debug(f"  KV pool cache saved: {current_model_name}")
+        # Save model object cache (params point to bump, zero extra VRAM)
+        if hasattr(runner, 'model') and runner.model is not None:
+            _model_cache[current_model_name] = runner.model
+            logger.debug(f"  Model cache saved: {current_model_name}")
+        rt_r = bump.regions.get("runtime")
+        if rt_r:
+            _runtime_cache[current_model_name] = rt_r.capacity
         if hasattr(scheduler, 'memory_saver_adapter') and scheduler.memory_saver_adapter.enabled:
             cached = _graph_cache.get(current_model_name, {})
             old_tag = cached.get('vmm_graph_tag', runner.vmm_graph_tag)
             scheduler.memory_saver_adapter.pause(old_tag)
-            logger.info(f"  VMM: paused graph pool tag={old_tag}")
+            logger.debug(f"  VMM: paused graph pool tag={old_tag}")
 
+    timings['save_caches'] = time.perf_counter() - t_p1; logger.debug(f"  save_caches: {timings['save_caches']*1000:.1f}ms")
+    # === Phase 2: Verify staging integrity (before clearing allocator) ===
     t0 = time.perf_counter()
+    _preload_mgr = getattr(scheduler, "_preload_manager", None)
+    _has_staging = (_preload_mgr is not None
+                    and _preload_mgr.model_name == target_model_name
+                    and _preload_mgr.num_staged > 0)
+    _staging_info = None
+    if _has_staging:
+        _preload_mgr.wait_complete()
+        cell_size = runner.get_cell_size_per_token(runner.num_effective_layers) if hasattr(runner, "get_cell_size_per_token") else 0
+        _preload_mgr.verify_integrity(bump, scheduler.token_to_kv_pool_allocator, cell_size)
+        _staging_info = _preload_mgr.staged
+        logger.debug(f"  Staging: {_preload_mgr.num_staged} staged, {_preload_mgr.num_evicted} evicted")
+
+    timings['staging_verify'] = time.perf_counter() - t0; logger.debug(f"  staging_verify: {timings['staging_verify']*1000:.1f}ms")
+    # === Phase 3: Cleanup ===
     runner.graph_runner = None
-    import gc; gc.collect()
-    # empty_cache skipped when graph cache is active (would free graph pool memory)
-    if current_model_name not in _graph_cache:
-        torch.cuda.empty_cache()
-    scheduler.flush_cache()
-    bump.release_region("kv_cache")
-    bump.release_region('weights')
     if 'runtime' in bump.regions:
         bump.release_region('runtime')
-    for attr in ['req_to_token_pool', 'token_to_kv_pool', 'token_to_kv_pool_allocator']:
-        for obj in [runner, scheduler, scheduler.tp_worker]:
-            if hasattr(obj, attr):
-                setattr(obj, attr, None)
     if hasattr(runner, 'attn_backend'):
         runner.attn_backend = None
-    if hasattr(runner, 'model'):
-        del runner.model
-        runner.model = None
-    timings['release'] = time.perf_counter() - t0
-    logger.info(f'  release: {timings["release"]:.3f}s (bump, no gc)')
-    t0 = time.perf_counter()
-    # Clear rotary embedding cache (get_rope has a module-level _ROPE_DICT)
-    # Without this, second load reuses the old RotaryEmbedding object whose
-    # cos_sin_cache was migrated to bump and data was overwritten by other model
     from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
     _ROPE_DICT.clear()
 
+    # === Phase 4: Load weights ===
+    t0 = _t = time.perf_counter()
     runner.server_args.model_path = target_model_path
     new_config = ModelConfig.from_server_args(runner.server_args, model_path=target_model_path)
+    _t1 = time.perf_counter()
     runner.model_config = new_config
     runner.start_layer = 0
     runner.end_layer = new_config.num_hidden_layers
     runner.num_effective_layers = new_config.num_hidden_layers
     runner.dtype = new_config.dtype
     runner.kv_cache_dtype = new_config.dtype
-    # Check for preloaded CPU model
+
     _cpu_model = None
     if hasattr(scheduler, '_model_registry') and scheduler._model_registry is not None:
         _cpu_model, _ = scheduler._model_registry.get_cpu_model(target_model_name or '')
-    if _cpu_model is not None:
-        runner._load_model_bump_from_cpu(_cpu_model)
+    _t2 = time.perf_counter()
+
+    # Try model cache: restore model object + D2D only (skip Python param loop)
+    _cached_model = _model_cache.get(target_model_name)
+    if _cached_model is not None and _has_staging:
+        # Model cache hit! Just D2D staging data to bump and restore model ref
+        _preload_mgr.wait_complete()
+        # Single memcpy: staging layout matches weights layout
+        w_region = bump.regions.get("weights")
+        if w_region:
+            d2d_stream = torch.cuda.Stream()
+            h2d_stream = torch.cuda.Stream()
+            evict_boundary = _preload_mgr.get_eviction_boundary(w_region.start)
+            valid_start = evict_boundary  # offset in bump buffer
+            valid_end = w_region.start + w_region.capacity
+            with torch.cuda.stream(d2d_stream):
+                if valid_start < valid_end:
+                    bump.buffer[valid_start : valid_end].copy_(
+                        bump.buffer[valid_start - w_region.start + _preload_mgr.staging_right_ptr :
+                                    valid_end - w_region.start + _preload_mgr.staging_right_ptr],
+                        non_blocking=True)
+            # H2D evicted portion from CPU
+            if evict_boundary > w_region.start and hasattr(scheduler, '_model_registry'):
+                cpu_model, _ = scheduler._model_registry.get_cpu_model(target_model_name or '')
+                if cpu_model is not None:
+                    evict_bytes = evict_boundary - w_region.start
+                    with torch.cuda.stream(h2d_stream):
+                        # Reconstruct left portion from CPU state dict
+                        offset = 0
+                        for name, p in cpu_model.named_parameters():
+                            nbytes = p.numel() * p.element_size()
+                            aligned = (nbytes + 255) & ~255
+                            if offset + nbytes <= evict_bytes:
+                                bump.buffer[w_region.start + offset : w_region.start + offset + nbytes].copy_(
+                                    p.data.view(-1).view(torch.uint8), non_blocking=True)
+                            elif offset < evict_bytes:
+                                # Partial overlap - H2D the evicted part only
+                                partial = evict_bytes - offset
+                                bump.buffer[w_region.start + offset : w_region.start + offset + partial].copy_(
+                                    p.data.view(-1).view(torch.uint8)[:partial], non_blocking=True)
+                            else:
+                                break
+                            offset += aligned
+                        for bname, buf in cpu_model.named_buffers():
+                            if buf is None or buf.numel() == 0:
+                                continue
+                            nbytes = buf.numel() * buf.element_size()
+                            aligned = (nbytes + 255) & ~255
+                            if offset + nbytes <= evict_bytes:
+                                bump.buffer[w_region.start + offset : w_region.start + offset + nbytes].copy_(
+                                    buf.data.view(-1).view(torch.uint8), non_blocking=True)
+                            elif offset < evict_bytes:
+                                partial = evict_bytes - offset
+                                bump.buffer[w_region.start + offset : w_region.start + offset + partial].copy_(
+                                    buf.data.view(-1).view(torch.uint8)[:partial], non_blocking=True)
+                            else:
+                                break
+                            offset += aligned
+            d2d_stream.synchronize()
+            h2d_stream.synchronize()
+        runner.model = _cached_model
+        runner.model.eval()
+        if "weights" in bump.regions:
+            bump.regions["weights"]._sub_offset = bump.regions["weights"].capacity
+        bump._current_model = target_model_name
+        total_weight_bytes = bump.regions["weights"].capacity if "weights" in bump.regions else 0
+        _t3 = time.perf_counter()
+        _t4 = time.perf_counter()
+        logger.debug(f'  load detail: config {(_t1-_t)*1000:.1f}ms, '
+                    f'MODEL CACHE HIT + D2D {(_t3-_t2)*1000:.1f}ms, '
+                    f'total {(_t3-_t)*1000:.1f}ms')
     else:
-        runner._load_model_bump()
+        # No model cache: full load via _load_model_bump_from_cpu
+        param_bytes = sum(p.numel() * p.element_size() for p in _cpu_model.parameters()) if _cpu_model else 0
+        buf_bytes = sum(b.numel() * b.element_size() for b in _cpu_model.buffers() if b is not None and b.numel() > 0) if _cpu_model else 0
+        total_weight_bytes = param_bytes + buf_bytes
+        if "weights" in bump.regions:
+            bump.reset_region("weights", total_weight_bytes)
+        else:
+            bump.allocate_region("weights", total_weight_bytes)
+        _t3 = time.perf_counter()
+        if _cpu_model is not None:
+            runner._load_model_bump_from_cpu(_cpu_model, staging_info=_staging_info)
+        else:
+            runner._load_model_bump()
+        _t4 = time.perf_counter()
+        logger.debug(f'  load detail: config {(_t1-_t)*1000:.1f}ms, '
+                    f'get_cpu_model {(_t2-_t1)*1000:.1f}ms, '
+                    f'reset_region {(_t3-_t2)*1000:.1f}ms, '
+                    f'load_bump {(_t4-_t3)*1000:.1f}ms, '
+                    f'total {(_t4-_t)*1000:.1f}ms')
     timings['load'] = time.perf_counter() - t0
     logger.info(f'  load: {timings["load"]:.3f}s')
+
+    # === Phase 5: KV cache + runtime rebuild ===
     t0 = time.perf_counter()
-    runner.init_memory_pool(0)
-    runner._init_runtime_region()  # re-allocate runtime for target model
+    # Try KV pool cache: skip init_memory_pool if same model switching back
+    _kv_cached = _kv_pool_cache.get(target_model_name) if target_model_name else None
+    if _kv_cached:
+        # Same model, same weights size → same bump layout → KV pool objects still valid
+        if "kv_cache" in bump.regions:
+            bump.reset_region("kv_cache", bump.get_available_bytes())
+        else:
+            bump.allocate_region("kv_cache", bump.get_available_bytes())
+        runner.req_to_token_pool = _kv_cached["req_to_token_pool"]
+        runner.token_to_kv_pool = _kv_cached["token_to_kv_pool"]
+        runner.token_to_kv_pool_allocator = _kv_cached["token_to_kv_pool_allocator"]
+        runner.max_total_num_tokens = _kv_cached["max_total_num_tokens"]
+        runner.max_running_requests = _kv_cached["max_running_requests"]
+        runner.token_to_kv_pool_allocator.clear()
+        scheduler.flush_cache()
+        logger.debug(f"  KV pool cache hit: {target_model_name}")
+    else:
+        # KV pool cache miss: release kv_cache, clear refs, full init
+        if 'kv_cache' in bump.regions:
+            bump.release_region('kv_cache')
+        scheduler.flush_cache()
+        for attr in ['req_to_token_pool', 'token_to_kv_pool', 'token_to_kv_pool_allocator']:
+            for obj in [runner, scheduler, scheduler.tp_worker]:
+                if hasattr(obj, attr):
+                    setattr(obj, attr, None)
+        runner.init_memory_pool(0)
+    _rt_cached = _runtime_cache.get(target_model_name)
+    if _rt_cached and "runtime" not in bump.regions:
+        bump.allocate_region("runtime", _rt_cached)
+    else:
+        runner._init_runtime_region()
     if not (target_model_name and target_model_name in _graph_cache):
         runner.init_attention_backend()
-    # else: attn_backend will be restored from cache
 
-    # Clear shared input buffer pool (dtype may change across models)
-    from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
-    _forward_input_buffer_pool.clear()
-
-    # CUDA graph: try restore from cache, else recapture
+    from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool; _forward_input_buffer_pool.clear()
+    # === Phase 5.5: KV staging restore ===
+    if _has_staging and hasattr(_preload_mgr, 'kv_staged') and _preload_mgr.kv_staged:
+        _restore_kv_from_staging(runner, _preload_mgr, bump, scheduler)
+    t_p6 = time.perf_counter(); logger.debug(f"  kv_runtime: {(t_p6-t0)*1000:.1f}ms")
+    # === Phase 6: CUDA graph restore ===
     if not scheduler.server_args.disable_cuda_graph:
-        # Set per-model VMM tag for this model
         new_tag = f"cuda_graph:{target_model_name}" if target_model_name else "cuda_graph"
         runner.vmm_graph_tag = new_tag
-        # VMM: resume physical pages if this model's graph was previously paused
         if hasattr(scheduler, 'memory_saver_adapter') and scheduler.memory_saver_adapter.enabled:
             cached = _graph_cache.get(target_model_name, {})
             resume_tag = cached.get('vmm_graph_tag')
             if resume_tag:
                 scheduler.memory_saver_adapter.resume(resume_tag)
-                logger.info(f"  VMM: resumed graph pool tag={resume_tag}")
+                logger.debug(f"  VMM: resumed graph pool tag={resume_tag}")
+        # Wait for H2D weight transfer if using async stream
+        if hasattr(runner, "_h2d_done_event"):
+            torch.cuda.current_stream().wait_event(runner._h2d_done_event)
         if not (target_model_name and _restore_graph_cache(runner, target_model_name)):
-            _set_graph_pool(None)  # Force new pool for this model
+            _set_graph_pool(None)
             runner.init_device_graphs()
+
+    t_p7 = time.perf_counter(); logger.debug(f"  graph_restore: {(t_p7-t_p6)*1000:.1f}ms")
+    # === Phase 7: Update scheduler/worker refs ===
     worker = scheduler.tp_worker
     worker.model_config = new_config
     worker.max_total_num_tokens = runner.max_total_num_tokens
@@ -529,18 +687,10 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     scheduler.max_running_requests = runner.max_running_requests
     scheduler.max_req_len = worker.max_req_len
     scheduler.max_req_input_len = worker.max_req_input_len
-    scheduler.flush_cache()
+    # tree_cache refs update (flush already done in Phase 5)
     if hasattr(scheduler, 'tree_cache') and scheduler.tree_cache is not None:
-        if hasattr(scheduler.tree_cache, 'reset'):
-            scheduler.tree_cache.reset()
-        if hasattr(scheduler.tree_cache, 'req_to_token_pool'):
-            scheduler.tree_cache.req_to_token_pool = runner.req_to_token_pool
-        if hasattr(scheduler.tree_cache, 'token_to_kv_pool_allocator'):
-            scheduler.tree_cache.token_to_kv_pool_allocator = runner.token_to_kv_pool_allocator
-
-    # Try to restore KV cache from snapshot
-    if target_model_name and hasattr(scheduler, 'tree_cache'):
-        _restore_kv_snapshot(scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, target_model_name)
+        scheduler.tree_cache.req_to_token_pool = runner.req_to_token_pool
+        scheduler.tree_cache.token_to_kv_pool_allocator = runner.token_to_kv_pool_allocator
 
     scheduler.model_config = new_config
     scheduler.server_args.model_path = target_model_path
@@ -554,9 +704,15 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     )
     if hasattr(scheduler, 'send_to_detokenizer'):
         scheduler.send_to_detokenizer.socket.send_pyobj(notif)
-    timings['reinit'] = time.perf_counter() - t0
-    logger.info(f'  reinit: {timings["reinit"]:.3f}s')
+
+    timings['update_refs'] = time.perf_counter() - t_p7; logger.debug(f"  update_refs: {timings['update_refs']*1000:.1f}ms")
+    timings['reinit_total'] = time.perf_counter() - t0; logger.debug(f"  reinit_total: {timings['reinit_total']*1000:.1f}ms")
     timings['total'] = time.perf_counter() - t_total
     logger.info(f'  TOTAL: {timings["total"]:.3f}s')
-    return timings
 
+    t_p8 = time.perf_counter()
+    # === Phase 8: Preload previous model for fast switch-back ===
+    if current_model_name and hasattr(scheduler, "_start_weight_preload"):
+        scheduler._start_weight_preload(current_model_name)
+    timings['preload_trigger'] = time.perf_counter() - t_p8; logger.debug(f"  preload_trigger: {timings['preload_trigger']*1000:.1f}ms")
+    return timings

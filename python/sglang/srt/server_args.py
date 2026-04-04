@@ -650,6 +650,7 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     enable_bump_allocator: bool = False
+    mem_fraction_bump: float = 0.95  # fraction of available GPU memory for bump allocator
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
@@ -5556,6 +5557,12 @@ class ServerArgs:
             "--enable-bump-allocator",
             action="store_true",
             help="Use bump allocator for self-managed VRAM (model hot-switching)",
+        )
+        parser.add_argument(
+            "--mem-fraction-bump",
+            type=float,
+            default=0.95,
+            help="Fraction of available GPU memory for bump allocator (default 0.95)",
         )
         parser.add_argument(
             "--enable-weights-cpu-backup",

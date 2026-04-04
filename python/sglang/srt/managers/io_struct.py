@@ -1965,9 +1965,6 @@ _check_all_req_types()
 # ── Model Hot-Switch ──
 
 @dataclass
-
-
-@dataclass
 class RegisterModelReqInput(BaseReq):
     """Register a new model for multi-model serving."""
     model_name: str
