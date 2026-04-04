@@ -2,11 +2,15 @@
 
 import math
 import re
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.voxtral import VoxtralForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -64,7 +68,7 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         input_text,
         request_obj,
         **kwargs,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[MultimodalProcessorOutput]:
         if not audio_data:
             return None
 
@@ -111,11 +115,11 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
                 item.offsets = [audio_offsets[i]]
             mm_items.append(item)
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": mm_items,
-            "audio_token_id": self.audio_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            audio_token_id=self.audio_token_id,
+        )
 
     @staticmethod
     def _insert_audio_placeholders(prompt: str, n_audio: int) -> str:
