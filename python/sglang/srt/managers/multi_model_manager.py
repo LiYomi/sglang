@@ -214,19 +214,15 @@ def _restore_kv_from_staging(runner, preload_mgr, bump, scheduler):
                 k_slot_bytes = k_buf[0].numel() * k_buf[0].element_size()
                 v_slot_bytes = v_buf[0].numel() * v_buf[0].element_size()
                 
-                # Copy each token's k data from staging to new slot
-                staging_k = bump.buffer[k_off : k_off + k_bytes]
-                staging_v = bump.buffer[v_off : v_off + v_bytes]
+                # Copy staging bytes -> view as original dtype -> scatter to KV pool
+                staging_k = bump.buffer[k_off : k_off + k_bytes].view(k_buf.dtype)
+                staging_v = bump.buffer[v_off : v_off + v_bytes].view(v_buf.dtype)
                 
-                # Reshape and scatter to new slots
-                k_shaped = staging_k.view(n_tokens, -1)
-                v_shaped = staging_v.view(n_tokens, -1)
+                k_shaped = staging_k.reshape(n_tokens, *k_buf.shape[1:])
+                v_shaped = staging_v.reshape(n_tokens, *v_buf.shape[1:])
                 
-                k_buf_flat = k_buf.view(k_buf.shape[0], -1)
-                v_buf_flat = v_buf.view(v_buf.shape[0], -1)
-                
-                k_buf_flat[new_slots] = k_shaped
-                v_buf_flat[new_slots] = v_shaped
+                k_buf[new_slots] = k_shaped
+                v_buf[new_slots] = v_shaped
         
         d2d_stream.synchronize()
         
