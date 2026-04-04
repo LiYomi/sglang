@@ -312,6 +312,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
+        self.vmm_graph_tag = f"cuda_graph:{server_args.served_model_name}"  # Per-model VMM tag
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.moe_ep_rank = moe_ep_rank
@@ -470,7 +471,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.enable_bump_allocator:
             from sglang.srt.utils.common import get_available_gpu_memory
             avail_gb = get_available_gpu_memory(self.device, self.gpu_id)
-            reserve_gb = 5.0
+            reserve_gb = 4.5  # graph pool + CUDA context + PyTorch allocator headroom
             managed_bytes = int((avail_gb - reserve_gb) * 1024**3)
             self.bump_vram_manager = BumpVRAMManager(managed_bytes, self.device)
 
@@ -1075,11 +1076,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             DefaultModelLoader, get_model_loader, _initialize_model,
             _get_quantization_config, set_default_torch_dtype,
         )
-        from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
 
         bump = self.bump_vram_manager
-        target_device = torch.device(self.device)
 
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
@@ -1087,10 +1087,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
 
-        # Load model normally first (PyTorch allocator handles all tensors)
+        # Phase 1: Initialize and load weights on CPU (zero GPU memory)
         quant_config = _get_quantization_config(self.model_config, self.load_config)
         with set_default_torch_dtype(self.model_config.dtype):
-            with target_device:
+            with torch.device("cpu"):
                 self.model = _initialize_model(
                     self.model_config, self.load_config, quant_config,
                 )
@@ -1100,45 +1100,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             weights = self.loader._get_all_weights(self.model_config, self.model)
             DefaultModelLoader.load_weights_and_postprocess(
-                self.model, weights, target_device,
+                self.model, weights, torch.device("cpu"),
             )
         self.model.eval()
+        logger.info("Bump: model initialized and weights loaded on CPU")
 
-        # Migrate parameters into bump buffer
-        # Log per-component sizes for determinism debugging
-        # Ensure rotary embedding cache is at final size BEFORE calculating sizes
-        # Must use reserve_rope_cache (not just context_len) to match the expansion
-        # that happens during init_attention_backend / graph capture warmup
-        # Log cos_sin_cache BEFORE reserve
-        for _m in self.model.modules():
-            if hasattr(_m, 'cos_sin_cache'):
-                logger.info(f'Bump PRE-reserve: cos_sin_cache ptr={_m.cos_sin_cache.data_ptr()}, shape={_m.cos_sin_cache.shape}, data[:4]={_m.cos_sin_cache.flatten()[:4].tolist()}')
-                break
-        from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
+        # Phase 2: Pre-expand rotary cache on CPU to ensure deterministic sizes
         reserve_rope_cache_for_long_sequences(self.model, self.server_args, self.model_config)
-        # Log cos_sin_cache AFTER reserve
-        for _m in self.model.modules():
-            if hasattr(_m, 'cos_sin_cache'):
-                logger.info(f'Bump POST-reserve: cos_sin_cache ptr={_m.cos_sin_cache.data_ptr()}, shape={_m.cos_sin_cache.shape}, data[:4]={_m.cos_sin_cache.flatten()[:4].tolist()}')
-                break
 
+        # Phase 3: Calculate total size and allocate bump region
         param_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
-        buf_items = [(n, b.numel() * b.element_size()) for n, b in self.model.named_buffers()
-                     if b is not None and b.device.type == 'cuda' and b.numel() > 0]
-        buf_bytes = sum(s for _, s in buf_items)
-        for bn, bs in buf_items:
-            logger.info(f'Bump: buffer {bn} = {bs} bytes ({bs/1024:.1f} KB)')
-        logger.info(f'Bump: params={param_bytes} bytes, buffers={buf_bytes} bytes')
-        total_param_bytes = param_bytes
-        total_param_bytes += sum(b.numel() * b.element_size() for b in self.model.buffers()
-                                if b is not None and b.device.type == 'cuda' and b.numel() > 0)
-        logger.info(f"Bump: total param size = {total_param_bytes / 1024**2:.1f} MB")
+        buf_bytes = sum(b.numel() * b.element_size() for b in self.model.buffers()
+                        if b is not None and b.numel() > 0)
+        total_bytes = param_bytes + buf_bytes
+        logger.info(f"Bump: params={param_bytes / 1024**2:.1f} MB, "
+                    f"buffers={buf_bytes / 1024**2:.1f} MB, "
+                    f"total={total_bytes / 1024**2:.1f} MB")
 
         if "weights" in bump.regions:
-            bump.reset_region("weights", total_param_bytes)
+            bump.reset_region("weights", total_bytes)
         else:
-            bump.allocate_region("weights", total_param_bytes)
+            bump.allocate_region("weights", total_bytes)
 
+        # Phase 4: Migrate parameters CPU -> bump (H2D transfer)
         for name, p in self.model.named_parameters():
             parts = name.split(".")
             module = self.model
@@ -1147,31 +1131,81 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             attr_name = parts[-1]
             managed = bump.create_tensor("weights", p.shape, p.dtype)
             managed.copy_(p.data)
-            new_param = torch.nn.Parameter(managed, requires_grad=p.requires_grad)
+            new_param = torch.nn.Parameter(managed, requires_grad=False)
             for k, v in p.__dict__.items():
                 if k not in new_param.__dict__:
                     setattr(new_param, k, v)
             setattr(module, attr_name, new_param)
 
-        # Migrate CUDA buffers (cos_sin_cache, etc.) into bump buffer
-        cuda_buffers = [(n, b) for n, b in self.model.named_buffers()
-                        if b is not None and b.device.type == 'cuda' and b.numel() > 0]
-        if cuda_buffers:
-            for buf_name, buf in cuda_buffers:
-                managed = bump.create_tensor('weights', buf.shape, buf.dtype)
-                logger.info(f'Bump migrate buf {buf_name}: src_ptr={buf.data_ptr()}, src[:4]={buf.flatten()[:4].tolist()}, dst_ptr={managed.data_ptr()}')
-                managed.copy_(buf.data)
-                logger.info(f'Bump migrate buf {buf_name}: dst[:4]={managed.flatten()[:4].tolist()}')
-                parts = buf_name.split('.')
-                module = self.model
-                for part in parts[:-1]:
-                    module = getattr(module, part)
-                module._buffers[parts[-1]] = managed
-            logger.info(f'Bump: {len(cuda_buffers)} buffers migrated')
+        # Phase 5: Migrate buffers CPU -> bump
+        cpu_buffers = [(n, b) for n, b in self.model.named_buffers()
+                       if b is not None and b.numel() > 0]
+        for buf_name, buf in cpu_buffers:
+            managed = bump.create_tensor("weights", buf.shape, buf.dtype)
+            managed.copy_(buf.data)
+            parts = buf_name.split(".")
+            module = self.model
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            module._buffers[parts[-1]] = managed
+        if cpu_buffers:
+            logger.info(f"Bump: {len(cpu_buffers)} buffers migrated")
 
-        import gc; gc.collect(); torch.cuda.empty_cache()
-        tag = "weights"; logger.info(f"Bump: weights migrated, used {bump.regions[tag].used_bytes / 1024**2:.1f} MB")
+        wt = "weights"
+        logger.info(f"Bump: weights migrated, used {bump.regions[wt].used_bytes / 1024**2:.1f} MB")
 
+    def _load_model_bump_from_cpu(self, cpu_model):
+        """Load model from preloaded CPU model into bump buffer. Skips disk I/O."""
+        bump = self.bump_vram_manager
+        self.model = cpu_model
+        self.model.eval()
+        logger.info("Bump: using preloaded CPU model (skipped disk I/O)")
+
+        # Phase 3: Calculate total size and allocate bump region
+        param_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        buf_bytes = sum(b.numel() * b.element_size() for b in self.model.buffers()
+                        if b is not None and b.numel() > 0)
+        total_bytes = param_bytes + buf_bytes
+        logger.info(f"Bump: params={param_bytes / 1024**2:.1f} MB, "
+                    f"buffers={buf_bytes / 1024**2:.1f} MB, "
+                    f"total={total_bytes / 1024**2:.1f} MB")
+
+        if "weights" in bump.regions:
+            bump.reset_region("weights", total_bytes)
+        else:
+            bump.allocate_region("weights", total_bytes)
+
+        # Phase 4: Migrate parameters CPU -> bump
+        for name, p in self.model.named_parameters():
+            parts = name.split(".")
+            module = self.model
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            attr_name = parts[-1]
+            managed = bump.create_tensor("weights", p.shape, p.dtype)
+            managed.copy_(p.data)
+            new_param = torch.nn.Parameter(managed, requires_grad=False)
+            for k, v in p.__dict__.items():
+                if k not in new_param.__dict__:
+                    setattr(new_param, k, v)
+            setattr(module, attr_name, new_param)
+
+        # Phase 5: Migrate buffers CPU -> bump
+        cpu_buffers = [(n, b) for n, b in self.model.named_buffers()
+                       if b is not None and b.numel() > 0]
+        for buf_name, buf in cpu_buffers:
+            managed = bump.create_tensor("weights", buf.shape, buf.dtype)
+            managed.copy_(buf.data)
+            parts = buf_name.split(".")
+            module = self.model
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            module._buffers[parts[-1]] = managed
+        if cpu_buffers:
+            logger.info(f"Bump: {len(cpu_buffers)} buffers migrated")
+
+        wt = "weights"
+        logger.info(f"Bump: weights migrated from preload, used {bump.regions[wt].used_bytes / 1024**2:.1f} MB")
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -1252,6 +1286,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Bump allocator path: meta-device init + managed buffer
         if self.bump_vram_manager is not None:
+            self._init_runtime_region()  # runtime at offset 0 (fixed position)
             self._load_model_bump()
         else:
             enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
@@ -2031,6 +2066,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         b = torch.ones((16, 16), dtype=dtype, device=device)
         c = a @ b
         return c
+
+    def _init_runtime_region(self):
+        """Allocate bump 'runtime' region for workspace + DecodeInputBuffers."""
+        bump = self.bump_vram_manager
+        if bump is None:
+            return
+        # Workspace: determined by model architecture (same logic as FlashInfer backend)
+        architectures = getattr(self.model_config.hf_config, 'architectures', []) or []
+        qwen_archs = ('Qwen2ForCausalLM', 'Qwen3ForCausalLM', 'MiMoForCausalLM',
+                       'Qwen3VLForConditionalGeneration', 'Qwen3VLMoeForConditionalGeneration')
+        if self.server_args.enable_deterministic_inference:
+            ws_size = 2048 * 1024 * 1024  # 2GB
+        elif any(a in architectures for a in qwen_archs):
+            ws_size = 512 * 1024 * 1024   # 512MB
+        else:
+            ws_size = 384 * 1024 * 1024   # 384MB (default)
+
+        # DecodeInputBuffers: computed from model config
+        vocab_size = getattr(self.model_config, 'vocab_size', 151936)
+        hidden_size = getattr(self.model_config, 'hidden_size', 4096)
+        max_bs = max(self.server_args.cuda_graph_bs) if self.server_args.cuda_graph_bs else 512
+        dtype_size = 2  # bf16/fp16
+        input_buf_size = (
+            max_bs * vocab_size * 4      # next_token_logits_buffer (float32)
+            + max_bs * hidden_size * dtype_size  # input_embeds
+            + max_bs * 8 * 10            # int64/int32 tensors
+            + max_bs * 4 * 4             # seq_lens, other int32
+            + 16 * 1024 * 1024           # 16MB safety margin
+        )
+
+        total_runtime = ws_size + input_buf_size
+        if "runtime" in bump.regions:
+            bump.reset_region("runtime", total_runtime)
+        else:
+            bump.allocate_region("runtime", total_runtime)
+        logger.info(f"Bump: runtime region: ws={ws_size/1024**2:.0f}MB + "
+                    f"input_buf={input_buf_size/1024**2:.0f}MB = "
+                    f"{total_runtime/1024**2:.0f}MB "
+                    f"(vocab={vocab_size}, max_bs={max_bs})")
 
     def init_attention_backend(self):
         """Init attention kernel backend."""

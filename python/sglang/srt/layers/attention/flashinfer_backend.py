@@ -201,22 +201,33 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Allocate buffers
         global global_workspace_buffer
-        if global_workspace_buffer is None:
-            # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
-            global_workspace_buffer = torch.empty(
-                global_workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
+        bump = getattr(model_runner, 'bump_vram_manager', None)
+        global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+        if bump is not None and "runtime" in bump.regions:
+            # Use VRAM-managed workspace (deterministic address)
+            if global_workspace_buffer is None or init_new_workspace:
+                self.workspace_buffer = bump.create_tensor(
+                    "runtime", (global_workspace_size,), torch.uint8)
+                if global_workspace_buffer is None:
+                    global_workspace_buffer = self.workspace_buffer
+            else:
+                self.workspace_buffer = global_workspace_buffer
         else:
-            self.workspace_buffer = global_workspace_buffer
+            # Fallback: PyTorch allocator
+            if global_workspace_buffer is None:
+                global_workspace_buffer = torch.empty(
+                    global_workspace_size,
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            if init_new_workspace:
+                self.workspace_buffer = torch.empty(
+                    global_workspace_size,
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            else:
+                self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
             self.kv_indptr = [

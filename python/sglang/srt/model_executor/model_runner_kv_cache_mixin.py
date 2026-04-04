@@ -148,6 +148,28 @@ class ModelRunnerKVCacheMixin:
             available_bytes = bump.get_available_bytes()
             # Reserve space for alignment padding (256 bytes per tensor * 2 * num_layers)
             alignment_overhead = 4096 * 2 * num_layers
+            # Reserve space for runtime region (workspace only)
+            # Reserve = workspace (1GB) + input_buffers (model-dependent)
+            vocab_size = getattr(self.model_config, 'vocab_size', 151936)
+            hidden_size = getattr(self.model_config, 'hidden_size', 4096)
+            max_bs = max(self.server_args.cuda_graph_bs) if self.server_args.cuda_graph_bs else 512
+            architectures = getattr(self.model_config.hf_config, 'architectures', []) or []
+            qwen_archs = ('Qwen2ForCausalLM', 'Qwen3ForCausalLM', 'MiMoForCausalLM',
+                           'Qwen3VLForConditionalGeneration', 'Qwen3VLMoeForConditionalGeneration')
+            if self.server_args.enable_deterministic_inference:
+                ws_size = 2048 * 1024 * 1024
+            elif any(a in architectures for a in qwen_archs):
+                ws_size = 512 * 1024 * 1024
+            else:
+                ws_size = 384 * 1024 * 1024
+            input_buf_size = (max_bs * vocab_size * 4
+                             + max_bs * hidden_size * 2
+                             + max_bs * 8 * 10
+                             + max_bs * 4 * 4
+                             + 16 * 1024 * 1024)
+            runtime_reserve = ws_size + input_buf_size
+            available_bytes -= runtime_reserve
+            logger.info(f"Bump: runtime reserve={runtime_reserve/1024**2:.0f}MB (workspace)")
             max_tokens = (available_bytes - alignment_overhead) // cell_size
             logger.info(
                 f"Bump: KV cache available={available_bytes/1024**2:.1f}MB, "

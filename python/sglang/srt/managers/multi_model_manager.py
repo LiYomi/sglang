@@ -52,7 +52,9 @@ def _save_kv_snapshot(tree_cache, allocator, model_name):
         }
 
         _kv_snapshots[model_name] = (saved_state, all_indices.cpu(), kv_data_cpu)
-        logger.info(f"  KV snapshot saved: {len(all_indices)} tokens for {model_name}")
+        logger.info(f"  KV snapshot saved: {len(all_indices)} indices, "
+                    f"evictable={inner.evictable_size_}, "
+                    f"allocator_available={allocator.available_size()} for {model_name}")
     except Exception as e:
         logger.warning(f"  KV snapshot save failed: {e}")
 
@@ -83,6 +85,11 @@ def _restore_kv_snapshot(tree_cache, allocator, model_name):
         allocator.free_pages = torch.tensor(new_free, dtype=allocator.free_pages.dtype,
                                             device=allocator.free_pages.device)
 
+        logger.info(f"  KV restore debug: saved_indices={len(saved_indices)}, "
+                    f"evictable_after={inner.evictable_size_}, "
+                    f"free_slots_before={len(allocator.free_pages) + len(used_set)}, "
+                    f"free_slots_after={len(new_free)}, "
+                    f"available_after={allocator.available_size()}")
         del _kv_snapshots[model_name]
         logger.info(f"  KV snapshot restored: {len(saved_indices)} tokens for {model_name}")
         return True
@@ -114,6 +121,7 @@ def _save_graph_cache(runner, model_name):
                 if b is not None and b.device.type == 'cuda' and b.numel() > 0:
                     saved_buffers[n] = b
         _graph_cache[model_name] = {
+            'vmm_graph_tag': runner.vmm_graph_tag,
             'graph_runner': runner.graph_runner,
             'attn_backend': runner.attn_backend,
             'input_buffer_pool': dict(_forward_input_buffer_pool),
@@ -429,6 +437,12 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         _save_kv_snapshot(scheduler.tree_cache, scheduler.token_to_kv_pool_allocator, current_model_name)
     if current_model_name:
         _save_graph_cache(runner, current_model_name)
+        # VMM: release physical pages of old model's graph pool
+        if hasattr(scheduler, 'memory_saver_adapter') and scheduler.memory_saver_adapter.enabled:
+            cached = _graph_cache.get(current_model_name, {})
+            old_tag = cached.get('vmm_graph_tag', runner.vmm_graph_tag)
+            scheduler.memory_saver_adapter.pause(old_tag)
+            logger.info(f"  VMM: paused graph pool tag={old_tag}")
 
     t0 = time.perf_counter()
     runner.graph_runner = None
@@ -437,8 +451,10 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     if current_model_name not in _graph_cache:
         torch.cuda.empty_cache()
     scheduler.flush_cache()
-    bump.release_region('kv_cache')
+    bump.release_region("kv_cache")
     bump.release_region('weights')
+    if 'runtime' in bump.regions:
+        bump.release_region('runtime')
     for attr in ['req_to_token_pool', 'token_to_kv_pool', 'token_to_kv_pool_allocator']:
         for obj in [runner, scheduler, scheduler.tp_worker]:
             if hasattr(obj, attr):
@@ -465,11 +481,19 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     runner.num_effective_layers = new_config.num_hidden_layers
     runner.dtype = new_config.dtype
     runner.kv_cache_dtype = new_config.dtype
-    runner._load_model_bump()
+    # Check for preloaded CPU model
+    _cpu_model = None
+    if hasattr(scheduler, '_model_registry') and scheduler._model_registry is not None:
+        _cpu_model, _ = scheduler._model_registry.get_cpu_model(target_model_name or '')
+    if _cpu_model is not None:
+        runner._load_model_bump_from_cpu(_cpu_model)
+    else:
+        runner._load_model_bump()
     timings['load'] = time.perf_counter() - t0
     logger.info(f'  load: {timings["load"]:.3f}s')
     t0 = time.perf_counter()
     runner.init_memory_pool(0)
+    runner._init_runtime_region()  # re-allocate runtime for target model
     if not (target_model_name and target_model_name in _graph_cache):
         runner.init_attention_backend()
     # else: attn_backend will be restored from cache
@@ -480,6 +504,16 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
 
     # CUDA graph: try restore from cache, else recapture
     if not scheduler.server_args.disable_cuda_graph:
+        # Set per-model VMM tag for this model
+        new_tag = f"cuda_graph:{target_model_name}" if target_model_name else "cuda_graph"
+        runner.vmm_graph_tag = new_tag
+        # VMM: resume physical pages if this model's graph was previously paused
+        if hasattr(scheduler, 'memory_saver_adapter') and scheduler.memory_saver_adapter.enabled:
+            cached = _graph_cache.get(target_model_name, {})
+            resume_tag = cached.get('vmm_graph_tag')
+            if resume_tag:
+                scheduler.memory_saver_adapter.resume(resume_tag)
+                logger.info(f"  VMM: resumed graph pool tag={resume_tag}")
         if not (target_model_name and _restore_graph_cache(runner, target_model_name)):
             _set_graph_pool(None)  # Force new pool for this model
             runner.init_device_graphs()

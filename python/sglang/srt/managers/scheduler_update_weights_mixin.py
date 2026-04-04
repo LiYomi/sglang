@@ -247,7 +247,8 @@ class SchedulerUpdateWeightsMixin:
             self._execute_model_switch(name, path)
 
     def register_model(self: "Scheduler", recv_req):
-        """Register a model name -> path mapping in scheduler."""
+        """Register a model name -> path mapping in scheduler.
+        If bump allocator is enabled, preloads model weights to CPU in background."""
         from sglang.srt.managers.io_struct import RegisterModelReqOutput
 
         if not hasattr(self, '_model_path_map'):
@@ -255,6 +256,17 @@ class SchedulerUpdateWeightsMixin:
 
         self._model_path_map[recv_req.model_name] = recv_req.model_path
         logger.info(f"Scheduler registered model: {recv_req.model_name} -> {recv_req.model_path}")
+
+        # Preload model to CPU in background if bump allocator is enabled
+        if not hasattr(self, '_model_registry'):
+            from sglang.srt.managers.model_registry import ModelRegistry
+            self._model_registry = ModelRegistry()
+        preload = getattr(self.tp_worker.model_runner, 'bump_vram_manager', None) is not None
+        self._model_registry.register(
+            recv_req.model_name, recv_req.model_path,
+            tokenizer=None, preload=preload,
+        )
+
         return RegisterModelReqOutput(success=True, message=f"Registered {recv_req.model_name}")
 def _export_static_state(model):
     return dict(

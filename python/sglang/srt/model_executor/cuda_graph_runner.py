@@ -145,6 +145,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         *,
         device: torch.device,
         max_bs: int,
+        bump_manager=None,  # BumpVRAMManager for VRAM-managed allocation
         max_num_token: int,
         hidden_size: int,
         vocab_size: int,
@@ -160,31 +161,41 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
     ) -> "DecodeInputBuffers":
+        def _alloc(shape, dtype):
+            """Allocate from bump 'runtime' region if available, else torch."""
+            if bump_manager is not None and "runtime" in bump_manager.regions:
+                t = bump_manager.create_tensor("runtime", shape, dtype)
+                t.zero_()
+                return t
+            return torch.zeros(shape, dtype=dtype, device=device)
+
+        def _alloc_full(shape, fill_value, dtype):
+            if bump_manager is not None and "runtime" in bump_manager.regions:
+                t = bump_manager.create_tensor("runtime", shape, dtype)
+                t.fill_(fill_value)
+                return t
+            return torch.full(shape, fill_value, dtype=dtype, device=device)
+
+        def _alloc_ones(shape, dtype):
+            if bump_manager is not None and "runtime" in bump_manager.regions:
+                t = bump_manager.create_tensor("runtime", shape, dtype)
+                t.fill_(1)
+                return t
+            return torch.ones(shape, dtype=dtype, device=device)
+
         with torch.device(device):
-            input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
-            input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
-            req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
-            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
-            out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-            positions = torch.zeros((max_num_token,), dtype=torch.int64)
-            mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-            custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
-                dtype=torch.bool,
-            )
-            next_token_logits_buffer = torch.zeros(
-                (max_num_token, vocab_size),
-                dtype=torch.float,
-            )
-            mamba_track_indices = (
-                torch.zeros((max_bs,), dtype=torch.int64)
-                if enable_mamba_track
-                else None
-            )
-            mamba_track_mask = (
-                torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
-            )
+            input_ids = _alloc((max_num_token,), torch.int64)
+            input_embeds = _alloc((max_num_token, hidden_size), dtype)
+            req_pool_indices = _alloc((max_bs,), torch.int64)
+            seq_lens = _alloc_full((max_bs,), seq_len_fill_value, torch.int32)
+            out_cache_loc = _alloc((max_num_token,), cache_loc_dtype)
+            positions = _alloc((max_num_token,), torch.int64)
+            mrope_positions = _alloc((3, max_num_token), torch.int64)
+            num_token_non_padded = _alloc((1,), torch.int32)
+            custom_mask = _alloc_ones(((max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,), torch.bool)
+            next_token_logits_buffer = _alloc((max_num_token, vocab_size), torch.float)
+            mamba_track_indices = _alloc((max_bs,), torch.int64) if enable_mamba_track else None
+            mamba_track_mask = _alloc((max_bs,), torch.bool) if enable_mamba_track else None
 
             if pp_size > 1:
                 pp_proxy_tensors = {
@@ -616,6 +627,7 @@ class CudaGraphRunner:
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
+            bump_manager=getattr(self.model_runner, 'bump_vram_manager', None),
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             vocab_size=self.model_runner.model_config.vocab_size,
@@ -822,7 +834,7 @@ class CudaGraphRunner:
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
         graph_fn = (
-            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            partial(memory_saver_adapter.cuda_graph, tag=self.model_runner.vmm_graph_tag)
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
