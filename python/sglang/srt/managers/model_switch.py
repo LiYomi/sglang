@@ -410,6 +410,32 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         bump.regions["weights"]._sub_offset = bump.regions["weights"].capacity
         bump._current_model = target_model_name
         logger.info(f"  Scatter D2D: {d2d_bytes / 1024**2:.1f}MB, H2D fallback: {h2d_bytes / 1024**2:.1f}MB")
+
+        # DEBUG: verify weights after D2D scatter gather
+        if h2d_src is not None:
+            torch.cuda.synchronize()
+            n_checked = 0
+            n_mismatch = 0
+            for name, cpu_t in list(h2d_src.items())[:5]:  # check first 5 params
+                # Find GPU tensor in model
+                parts = name.split(".")
+                obj = runner.model
+                try:
+                    for p in parts:
+                        obj = getattr(obj, p)
+                    gpu_t = obj.data
+                    cpu_ref = cpu_t.to(gpu_t.dtype).to(gpu_t.device)
+                    if not torch.equal(gpu_t, cpu_ref):
+                        max_diff = (gpu_t.float() - cpu_ref.float()).abs().max().item()
+                        logger.warning(f"  WEIGHT MISMATCH: {name} max_diff={max_diff:.6f} shape={gpu_t.shape}")
+                        n_mismatch += 1
+                    n_checked += 1
+                except (AttributeError, RuntimeError) as e:
+                    pass
+            if n_mismatch > 0:
+                logger.error(f"  WEIGHT VERIFY: {n_mismatch}/{n_checked} params MISMATCHED!")
+            else:
+                logger.info(f"  WEIGHT VERIFY: {n_checked} params checked, all match")
     else:
         # Full load via _load_model_bump from CPU or disk
         if _cpu_model is not None:
