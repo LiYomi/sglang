@@ -149,6 +149,8 @@ class PreloadManager:
             return 0, 0, 0, 0
 
         staged_per_block = math.ceil(staged_bytes / num_blocks)
+        # Align to row_size so D2D stride matches H2D write size
+        staged_per_block = math.ceil(staged_per_block / row_size) * row_size
         staging_rows = math.ceil(staged_per_block / row_size)
         staging_start = pool_size - staging_rows
 

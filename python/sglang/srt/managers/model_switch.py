@@ -396,6 +396,13 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
             h2d_src = {k: v.detach().cpu().clone() for k, v in _cpu_model.state_dict().items()}
 
         total_target = needed_bytes or current_cap
+        # DEBUG: check staging data before D2D
+        _si_dbg = _preload_mgr.scatter_info
+        _blk0 = _preload_mgr.block_tensors[0]
+        _stg_start = _si_dbg.staging_start * _si_dbg.row_size
+        _stg_data = _blk0.view(-1).view(torch.uint8)[_stg_start:_stg_start+32]
+        logger.info(f"  DEBUG staging pre-D2D: block0[{_stg_start}:{_stg_start+32}] = {_stg_data[:16].tolist()}")
+        logger.info(f"  DEBUG staging nonzero: {(_stg_data != 0).sum().item()}/32")
         d2d_bytes, h2d_bytes = _scatter_gather_weights(
             si=_preload_mgr.scatter_info,
             blocks=_preload_mgr.block_tensors,
@@ -411,7 +418,36 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         bump._current_model = target_model_name
         logger.info(f"  Scatter D2D: {d2d_bytes / 1024**2:.1f}MB, H2D fallback: {h2d_bytes / 1024**2:.1f}MB")
 
+        # DEBUG: compare raw bump bytes with CPU serialized stream
+        if h2d_src is not None:
+            torch.cuda.synchronize()
+            from sglang.srt.mem_cache.weight_staging import PreloadManager
+            padded_len = _preload_mgr.scatter_info.num_blocks * _preload_mgr.scatter_info.staged_per_block
+            cpu_ref = PreloadManager._serialize_params(h2d_src, padded_len, 1, padded_len)
+            gpu_bytes = bump.buffer[weights_start : weights_start + min(padded_len, len(cpu_ref))].cpu()
+            n_compare = min(300000000, len(cpu_ref))  # compare first 1MB
+            match = torch.equal(gpu_bytes[:n_compare], cpu_ref[:n_compare])
+            if not match:
+                diff_mask = (gpu_bytes[:n_compare] != cpu_ref[:n_compare])
+                n_diff = diff_mask.sum().item()
+                first_diff = diff_mask.nonzero(as_tuple=True)[0][0].item() if n_diff > 0 else -1
+                logger.error(f"  RAW BYTE MISMATCH: {n_diff}/{n_compare} bytes differ, first at offset {first_diff}")
+                logger.error(f"    GPU[{first_diff}:{first_diff+8}] = {gpu_bytes[first_diff:first_diff+8].tolist()}")
+                logger.error(f"    CPU[{first_diff}:{first_diff+8}] = {cpu_ref[first_diff:first_diff+8].tolist()}")
+            else:
+                logger.info(f"  RAW BYTE VERIFY: first {n_compare} bytes match!")
+
         # DEBUG: verify weights after D2D scatter gather
+        # First, check if D2D wrote to correct location
+        logger.info(f"  DEBUG D2D: weights_start={weights_start}, staged_per_block={_preload_mgr.scatter_info.staged_per_block}, num_blocks={_preload_mgr.scatter_info.num_blocks}")
+        # Check model params' actual bump offsets
+        bump_base = bump.buffer.data_ptr()
+        for i, (name, p) in enumerate(runner.model.named_parameters()):
+            if i >= 3: break
+            param_ptr = p.data.data_ptr()
+            param_offset = param_ptr - bump_base
+            param_bytes = p.data.numel() * p.data.element_size()
+            logger.info(f"  DEBUG param {name}: offset={param_offset}, nbytes={param_bytes}, shape={p.data.shape}")
         if h2d_src is not None:
             torch.cuda.synchronize()
             n_checked = 0
