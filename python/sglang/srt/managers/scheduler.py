@@ -81,6 +81,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
+    RegisterModelReqInput,
     AbortReq,
     ActiveRanksOutput,
     AttachHiCacheStorageReqInput,
@@ -1254,6 +1255,7 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (RegisterModelReqInput, self.register_model),
             ]
         )
 
