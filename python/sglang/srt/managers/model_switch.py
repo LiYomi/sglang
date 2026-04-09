@@ -433,6 +433,14 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         bump._current_model = target_model_name
         logger.info(f"  Scatter D2D: {d2d_bytes / 1024**2:.1f}MB, H2D fallback: {h2d_bytes / 1024**2:.1f}MB")
 
+        # DEBUG: compare param ordering
+        if h2d_src is not None:
+            sd_keys = list(h2d_src.keys())[:5]
+            np_keys = [n for n, _ in runner.model.named_parameters()][:5]
+            logger.info(f"  DEBUG key order: sd={sd_keys}")
+            logger.info(f"  DEBUG key order: np={np_keys}")
+            logger.info(f"  DEBUG keys match: {sd_keys == np_keys}")
+
         # DEBUG: compare raw bump bytes with CPU serialized stream
         if h2d_src is not None:
             torch.cuda.synchronize()
@@ -440,7 +448,7 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
             padded_len = _preload_mgr.scatter_info.num_blocks * _preload_mgr.scatter_info.staged_per_block
             cpu_ref = PreloadManager._serialize_params(h2d_src, padded_len, 1, padded_len)
             gpu_bytes = bump.buffer[weights_start : weights_start + min(padded_len, len(cpu_ref))].cpu()
-            n_compare = min(300000000, len(cpu_ref))  # compare first 1MB
+            n_compare = len(cpu_ref)  # compare ALL bytes  # compare first 1MB
             match = torch.equal(gpu_bytes[:n_compare], cpu_ref[:n_compare])
             if not match:
                 diff_mask = (gpu_bytes[:n_compare] != cpu_ref[:n_compare])
