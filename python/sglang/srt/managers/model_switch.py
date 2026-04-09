@@ -530,12 +530,22 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         runner.max_total_num_tokens = _kv_cached["max_total_num_tokens"]
         runner.max_running_requests = _kv_cached["max_running_requests"]
         runner.token_to_kv_pool_allocator.clear()
-        scheduler.flush_cache()
+        # Force flush: tree_cache.reset() + allocator.clear() (bypass idle check)
+        scheduler.tree_cache.reset()
+        if scheduler.token_to_kv_pool_allocator is not None:
+            scheduler.token_to_kv_pool_allocator.clear()
+        scheduler.grammar_manager.clear()
+        logger.info("Cache force-flushed for model switch")
         logger.debug(f"  KV pool cache hit: {target_model_name}")
     else:
         if "kv_cache" in bump.regions:
             bump.release_region("kv_cache")
-        scheduler.flush_cache()
+        # Force flush: tree_cache.reset() + allocator.clear() (bypass idle check)
+        scheduler.tree_cache.reset()
+        if scheduler.token_to_kv_pool_allocator is not None:
+            scheduler.token_to_kv_pool_allocator.clear()
+        scheduler.grammar_manager.clear()
+        logger.info("Cache force-flushed for model switch")
         for attr in ["req_to_token_pool", "token_to_kv_pool", "token_to_kv_pool_allocator"]:
             for obj in [runner, scheduler, scheduler.tp_worker]:
                 setattr(obj, attr, None)
