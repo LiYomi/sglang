@@ -2188,6 +2188,9 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # If a model switch is pending, do not schedule new batches
+        if self._pending_switch is not None:
+            return None
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
