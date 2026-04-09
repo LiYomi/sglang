@@ -220,6 +220,7 @@ class GenerateReqInput(BaseReq):
     routing_key: Optional[str] = None
 
     # Model name for multi-model serving
+    model_name: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -737,6 +738,7 @@ class TokenizedGenerateReqInput(BaseReq):
     routing_key: Optional[str] = None
 
     # Model name for multi-model serving
+    model_name: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
