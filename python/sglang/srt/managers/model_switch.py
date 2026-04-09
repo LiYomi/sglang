@@ -415,6 +415,21 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         runner.model = _cached_model
         runner.model.eval()
         bump.regions["weights"]._sub_offset = bump.regions["weights"].capacity
+
+        # Move non-persistent buffers (cos_sin_cache etc.) to GPU
+        for name, buf in runner.model.named_buffers():
+            if buf is not None and buf.device.type == "cpu":
+                parts = name.split(".")
+                module = runner.model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module._buffers[parts[-1]] = buf.to(runner.device)
+
+        # Recompute RoPE cache for new model
+        from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+        _ROPE_DICT.clear()
+        from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
+        reserve_rope_cache_for_long_sequences(runner.model, runner.server_args, runner.model_config)
         bump._current_model = target_model_name
         logger.info(f"  Scatter D2D: {d2d_bytes / 1024**2:.1f}MB, H2D fallback: {h2d_bytes / 1024**2:.1f}MB")
 
