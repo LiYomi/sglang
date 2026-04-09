@@ -1226,7 +1226,6 @@ class SchedulerOutputProcessorMixin:
                     load=load,
                     dp_ranks=dp_ranks,
                     model_name=self.active_model_name,
-                    model_path=self.server_args.model_path,
                 )
             )
 
