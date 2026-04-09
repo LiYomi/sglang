@@ -1312,6 +1312,9 @@ class Scheduler(
                 self.cancel_bubble_timer()
                 continue
 
+            # Execute deferred model switch before scheduling new batches
+            self._execute_pending_switch()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1323,9 +1326,6 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
-                # Check for deferred model switch
-                self._execute_pending_switch()
-
             # Check if a model needs preloading (non-blocking, runs in background thread)
             self._check_preload()
 
@@ -1354,6 +1354,8 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
+            # Execute deferred model switch before scheduling new batches
+            self._execute_pending_switch()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
@@ -1378,9 +1380,6 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
-                # Check for deferred model switch
-                self._execute_pending_switch()
-
             # Check if a model needs preloading (non-blocking, runs in background thread)
             self._check_preload()
 
