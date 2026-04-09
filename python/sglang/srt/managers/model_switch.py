@@ -438,9 +438,13 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     if _kv_cached:
         if "kv_cache" in bump.regions:
             bump.release_region("kv_cache")
-        from sglang.srt.model_executor.model_runner import _estimate_runtime_bytes
-        _rt_ws, _rt_buf = _estimate_runtime_bytes(runner.server_args, runner.model_config)
-        _kv_cap = min(_kv_cached["kv_region_capacity"], bump.get_available_bytes() - _rt_ws - _rt_buf)
+        # Estimate runtime size from _init_runtime_region logic
+        from sglang.srt.environ import envs
+        _ws = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+        archs = getattr(runner.model_config.hf_config, "architectures", []) or []
+        if any(a.startswith(("Qwen2", "Qwen3", "MiMo")) for a in archs):
+            _ws = max(_ws, 512 * 1024 * 1024)
+        _kv_cap = min(_kv_cached["kv_region_capacity"], bump.get_available_bytes() - _ws)
         _kv_cap = max(_kv_cap, 0)
         bump.allocate_region("kv_cache", _kv_cap)
         runner.req_to_token_pool = _kv_cached["req_to_token_pool"]
@@ -459,15 +463,8 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
             for obj in [runner, scheduler, scheduler.tp_worker]:
                 setattr(obj, attr, None)
         # Allocate runtime BEFORE KV so init_memory_pool doesn't consume all space
-        _rt_cached = _runtime_cache.get(target_model_name)
-        if _rt_cached and "runtime" not in bump.regions:
-            bump.allocate_region("runtime", _rt_cached)
-            from sglang.srt.model_executor.model_runner import _estimate_runtime_bytes
-            _ws_size, _ = _estimate_runtime_bytes(runner.server_args, runner.model_config)
-            from sglang.srt.environ import envs
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(_ws_size)
-        else:
-            runner._init_runtime_region()
+        # Always use _init_runtime_region for correct workspace sizing
+        runner._init_runtime_region()
         logger.info(f"  KV pool init: num_heads={runner.model_config.num_attention_heads}, "
                     f"num_kv_heads={runner.model_config.get_num_kv_heads(1)}, "
                     f"head_dim={runner.model_config.head_dim}, "
