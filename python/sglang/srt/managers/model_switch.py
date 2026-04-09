@@ -458,23 +458,23 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         for attr in ["req_to_token_pool", "token_to_kv_pool", "token_to_kv_pool_allocator"]:
             for obj in [runner, scheduler, scheduler.tp_worker]:
                 setattr(obj, attr, None)
+        # Allocate runtime BEFORE KV so init_memory_pool doesn't consume all space
+        _rt_cached = _runtime_cache.get(target_model_name)
+        if _rt_cached and "runtime" not in bump.regions:
+            bump.allocate_region("runtime", _rt_cached)
+            from sglang.srt.model_executor.model_runner import _estimate_runtime_bytes
+            _ws_size, _ = _estimate_runtime_bytes(runner.server_args, runner.model_config)
+            from sglang.srt.environ import envs
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(_ws_size)
+        else:
+            runner._init_runtime_region()
         runner.init_memory_pool(0)
 
     timings["kv_cache"] = time.perf_counter() - t0
     logger.debug(f"  kv_cache: {timings['kv_cache']*1000:.1f}ms")
 
-    # === Phase 4: Runtime & CUDA graph ===
+    # === Phase 4: Attention backend + CUDA graph ===
     t0 = time.perf_counter()
-
-    _rt_cached = _runtime_cache.get(target_model_name)
-    if _rt_cached and "runtime" not in bump.regions:
-        bump.allocate_region("runtime", _rt_cached)
-        from sglang.srt.model_executor.model_runner import _estimate_runtime_bytes
-        _ws_size, _ = _estimate_runtime_bytes(runner.server_args, runner.model_config)
-        from sglang.srt.environ import envs
-        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(_ws_size)
-    else:
-        runner._init_runtime_region()
     runner.init_attention_backend()
 
     from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
