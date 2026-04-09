@@ -1177,6 +1177,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.environ import envs
         ws_size = (2048 * 1024 * 1024 if self.server_args.enable_deterministic_inference
                    else envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get())
+        # Qwen2/Qwen3 models need 512MB workspace (set by FlashInfer backend init).
+        # Pre-allocate enough to avoid runtime region OOM.
+        archs = getattr(self.model_config.hf_config, 'architectures', []) or []
+        if any(a.startswith(('Qwen2', 'Qwen3', 'MiMo')) for a in archs):
+            ws_size = max(ws_size, 512 * 1024 * 1024)
 
         # Estimate DecodeInputBuffers size (allocated into runtime region during graph capture)
         buf_size = 0
@@ -1198,7 +1203,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 + 4                                        # num_token_non_padded (int32)
                 + max_num_token * vocab_size * 4            # next_token_logits_buffer (float32)
             )
-            buf_size = int(buf_size * 1.1)  # 10% headroom for alignment + misc
+            buf_size = int(buf_size * 1.5)  # 10% headroom for alignment + misc
 
         total_size = ws_size + buf_size
         if "runtime" in bump.regions:
@@ -1242,7 +1247,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Migrate parameters to bump (D2D for staged, H2D for the rest)
         self._migrate_params_to_bump(staging_info=staging_info, skip_region_alloc=skip_region_alloc)
 
-        # Ensure non-persistent buffers (cos_sin_cache) are on GPU
+        # Move non-persistent buffers (inv_freq, cos_sin_cache etc.) to GPU
+        # so reserve_rope_cache recomputes them on the correct device.
+        for name, buf in self.model.named_buffers():
+            if buf is not None and buf.device.type == "cpu":
+                parts = name.split(".")
+                module = self.model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module._buffers[parts[-1]] = buf.to(self.device)
+
         from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
         reserve_rope_cache_for_long_sequences(self.model, self.server_args, self.model_config)
 
