@@ -318,6 +318,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            model_name=request.model,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
@@ -477,8 +478,15 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            # Multi-model: resolve tokenizer for chat template
+            _chat_tokenizer = self.tokenizer_manager.tokenizer
+            if hasattr(self.tokenizer_manager, "model_tokenizers") and request.model:
+                _target_tok = self.tokenizer_manager.model_tokenizers.get(request.model)
+                if _target_tok is not None and getattr(_target_tok, "chat_template", None):
+                    _chat_tokenizer = _target_tok
+
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                prompt_ids = _chat_tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
@@ -495,7 +503,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    prompt_ids = _chat_tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
                         add_generation_prompt=True,

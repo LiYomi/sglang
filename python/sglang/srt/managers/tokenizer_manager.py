@@ -223,6 +223,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Multi-model: tokenizer cache {model_name -> tokenizer}
+        model_name = self.served_model_name or self.model_path
+        self.model_tokenizers = {model_name: self.tokenizer}
+
     def init_model_config(self):
         server_args = self.server_args
         model_config_class = getattr(self, "model_config_class", ModelConfig)
@@ -507,6 +511,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
+            # Multi-model: use target model's tokenizer
+            model_name = getattr(obj, "model_name", None)
+            if model_name and model_name in self.model_tokenizers:
+                self.tokenizer = self.model_tokenizers[model_name]
+
             await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
@@ -973,6 +982,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                model_name=getattr(obj, "model_name", None),
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -2474,6 +2484,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+
+    def register_model_local(self, model_name: str, model_path: str) -> dict:
+        """Register a new model's tokenizer locally."""
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        try:
+            new_tokenizer = get_tokenizer(
+                model_path,
+                tokenizer_mode=self.server_args.tokenizer_mode,
+                trust_remote_code=self.server_args.trust_remote_code,
+            )
+            self.model_tokenizers[model_name] = new_tokenizer
+            return {"success": True, "message": f"Model {model_name} registered"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
 
 class ServerStatus(Enum):

@@ -140,6 +140,39 @@ class ModelRunnerKVCacheMixin:
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
+        # Bump allocator: compute from managed buffer remaining space
+        if getattr(self, "bump_vram_manager", None) is not None:
+            bump = self.bump_vram_manager
+            cell_size = self.get_cell_size_per_token(self.num_effective_layers)
+            available_bytes = bump.get_available_bytes()
+            # Reserve runtime region (workspace + decode input buffers)
+            from sglang.srt.environ import envs
+            ws_size = (2048 * 1024 * 1024 if self.server_args.enable_deterministic_inference
+                       else envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get())
+            buf_size = 0
+            if not self.server_args.disable_cuda_graph:
+                max_bs = max(self.server_args.cuda_graph_bs)
+                max_num_token = max_bs
+                hidden_size = self.model_config.hidden_size
+                vocab_size = self.model_config.vocab_size
+                dtype_size = 2 if self.model_config.dtype in (torch.float16, torch.bfloat16) else 4
+                buf_size = (
+                    max_num_token * 8
+                    + max_num_token * hidden_size * dtype_size
+                    + max_bs * 8 + max_bs * 4
+                    + max_num_token * 8 + max_num_token * 8
+                    + 3 * max_num_token * 8 + 4
+                    + max_num_token * vocab_size * 4
+                )
+                buf_size = int(buf_size * 1.1)
+            available_bytes -= (ws_size + buf_size)
+            max_tokens = available_bytes // cell_size
+            logger.info(
+                f"Bump: KV cache available={available_bytes/1024**2:.1f}MB, "
+                f"cell_size={cell_size}, max_tokens={max_tokens}"
+            )
+            return max_tokens
+
         post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -705,6 +738,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        bump_vram_manager=getattr(self, "bump_vram_manager", None),
                     )
 
         # Initialize token_to_kv_pool_allocator
@@ -773,6 +807,7 @@ class ModelRunnerKVCacheMixin:
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            lifo_mode=getattr(self.server_args, "enable_bump_allocator", False),
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(

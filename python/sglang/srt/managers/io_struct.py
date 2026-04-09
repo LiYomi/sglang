@@ -219,6 +219,8 @@ class GenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
+    # Model name for multi-model serving
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -734,6 +736,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
+    # Model name for multi-model serving
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -993,6 +997,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
+
     # The routed experts for each token, including both input and output tokens
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
@@ -1005,6 +1010,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Multi-model: detokenizer selects tokenizer by model_name
+    model_name: Optional[str] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -1054,6 +1062,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
+
     # The routed experts for each token, including both input and output tokens
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
@@ -1066,6 +1075,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Multi-model: detokenizer selects tokenizer by model_name
+    model_name: Optional[str] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -1099,6 +1111,9 @@ class BatchEmbeddingOutput(BaseBatchReq):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Multi-model: detokenizer selects tokenizer by model_name
+    model_name: Optional[str] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
@@ -1954,3 +1969,27 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+
+# ── Model Hot-Switch ──
+
+@dataclass
+class RegisterModelReqInput(BaseReq):
+    """Register a new model for multi-model serving."""
+    model_name: str
+    model_path: str
+
+
+@dataclass
+class RegisterModelReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class RegisterModelNotification:
+    """Sent from scheduler to detokenizer to pre-cache tokenizer."""
+    model_name: str
+    model_path: str
+
+

@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    RegisterModelReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -380,6 +381,9 @@ class Scheduler(
         # Init mamba backend
         self.init_mamba_backend()
 
+        # Init CPU model cache before model worker (model_runner._load_model_bump needs it)
+        self.init_cpu_model_cache()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -391,6 +395,9 @@ class Scheduler(
 
         # Init running status
         self.init_running_status()
+
+        # Init KV transfer for multi-model hot-switching
+        self.init_kv_transfer()
 
         # Init chunked prefill
         self.init_chunked_prefill()
@@ -435,6 +442,7 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.active_model_name = self.server_args.served_model_name or self.server_args.model_path
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
@@ -627,6 +635,29 @@ class Scheduler(
     def init_model_worker(self):
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
+
+    def init_cpu_model_cache(self):
+        """Initialize global CPU model cache for multi-model hot-switching."""
+        if self.server_args.enable_bump_allocator:
+            from sglang.srt.mem_cache.cpu_model_cache import get_cpu_model_cache
+            self._cpu_model_cache = get_cpu_model_cache()
+            # Register startup model (load() will be called by model_runner._load_model_bump)
+            model_name = self.server_args.served_model_name or self.server_args.model_path
+            self._cpu_model_cache.register(model_name, self.server_args.model_path)
+        else:
+            self._cpu_model_cache = None
+
+    def init_kv_transfer(self):
+        """Initialize KV transfer for continuous D2H backup during hot-switching."""
+        if self.server_args.enable_bump_allocator:
+            from sglang.srt.mem_cache.kv_transfer import KVTransfer
+            self._kv_transfer = KVTransfer()
+        else:
+            self._kv_transfer = None
+        self._preload_thread = None
+        self._preload_manager = None
+        self._pending_switch = None
+        self._prev_model_name = None
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -1205,6 +1236,7 @@ class Scheduler(
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
+                (RegisterModelReqInput, self.register_model),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
@@ -1292,6 +1324,11 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
+                # Check for deferred model switch
+                self._execute_pending_switch()
+
+            # Check if a model needs preloading (non-blocking, runs in background thread)
+            self._check_preload()
 
             # Update last_batch
             self.last_batch = batch
@@ -1696,6 +1733,11 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # ── Multi-model: check if model switch is needed ──
+        target = recv_req.model_name
+        logger.info(f"handle_generate_request: model_name={target}, active={self.active_model_name}")
+        if target and target != self.active_model_name:
+            self._prepare_model_switch(target)
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None

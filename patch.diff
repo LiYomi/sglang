@@ -1,0 +1,2779 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 0f1aee929..6b3fa10fa 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -129,6 +129,7 @@ from sglang.srt.managers.io_struct import (
+     PauseGenerationReqInput,
+     ProfileReqInput,
+     ReleaseMemoryOccupationReqInput,
++    RegisterModelReqInput,
+     ResumeMemoryOccupationReqInput,
+     SendWeightsToRemoteInstanceReqInput,
+     SeparateReasoningReqInput,
+@@ -1191,6 +1192,26 @@ async def resume_memory_occupation(
+         return _create_error_response(e)
+ 
+ 
++@app.api_route("/register_model", methods=["POST"])
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def register_model(obj: RegisterModelReqInput, request: Request):
++    """Register a new model for multi-model serving."""
++    try:
++        result = await _global_state.tokenizer_manager.register_model(obj, request)
++        return ORJSONResponse(result)
++    except Exception as e:
++        return _create_error_response(e)
++
++
++@app.api_route("/list_models", methods=["GET"])
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def list_models(request: Request):
++    """List all registered models."""
++    tokenizers = _global_state.tokenizer_manager.model_tokenizers
++    return ORJSONResponse({
++        "models": list(tokenizers.keys()),
++    })
++
+ @app.post("/weights_checker")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def check_weights(obj: CheckWeightsReqInput, request: Request):
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 81610fe59..ec0ad8844 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -318,6 +318,7 @@ class OpenAIServingChat(OpenAIServingBase):
+             routing_key=self.extract_routing_key(raw_request),
+             custom_labels=custom_labels,
+             custom_logit_processor=request.custom_logit_processor,
++            model_name=request.model,
+             image_max_dynamic_patch=img_max_dynamic_patch,
+             video_max_dynamic_patch=vid_max_dynamic_patch,
+             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+@@ -477,8 +478,15 @@ class OpenAIServingChat(OpenAIServingBase):
+             if request.chat_template_kwargs:
+                 extra_template_kwargs.update(request.chat_template_kwargs)
+ 
++            # Multi-model: resolve tokenizer for chat template
++            _chat_tokenizer = self.tokenizer_manager.tokenizer
++            if hasattr(self.tokenizer_manager, "model_tokenizers") and request.model:
++                _target_tok = self.tokenizer_manager.model_tokenizers.get(request.model)
++                if _target_tok is not None and getattr(_target_tok, "chat_template", None):
++                    _chat_tokenizer = _target_tok
++
+             try:
+-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
++                prompt_ids = _chat_tokenizer.apply_chat_template(
+                     openai_compatible_messages,
+                     tokenize=True,
+                     add_generation_prompt=True,
+@@ -495,7 +503,7 @@ class OpenAIServingChat(OpenAIServingBase):
+                     else None
+                 )
+                 try:
+-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
++                    prompt_ids = _chat_tokenizer.apply_chat_template(
+                         openai_compatible_messages,
+                         tokenize=True,
+                         add_generation_prompt=True,
+diff --git a/python/sglang/srt/entrypoints/openai/serving_completions.py b/python/sglang/srt/entrypoints/openai/serving_completions.py
+index 8c4f79c1b..344dac51b 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_completions.py
++++ b/python/sglang/srt/entrypoints/openai/serving_completions.py
+@@ -127,6 +127,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
+             routing_key=self.extract_routing_key(raw_request),
+             custom_labels=custom_labels,
+             custom_logit_processor=request.custom_logit_processor,
++            model_name=request.model,
+         )
+ 
+         return adapted_request, request
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index 4fe8aec31..01095eb5f 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -201,22 +201,29 @@ class FlashInferAttnBackend(AttentionBackend):
+ 
+         # Allocate buffers
+         global global_workspace_buffer
+-        if global_workspace_buffer is None:
+-            # different from flashinfer zero_init_global_workspace_buffer
+-            global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+-            global_workspace_buffer = torch.empty(
+-                global_workspace_size,
+-                dtype=torch.uint8,
+-                device=model_runner.device,
+-            )
+-        if init_new_workspace:
+-            self.workspace_buffer = torch.empty(
+-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+-                dtype=torch.uint8,
+-                device=model_runner.device,
+-            )
+-        else:
++        bump = getattr(model_runner, 'bump_vram_manager', None)
++        global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
++        if bump is not None and "runtime" in bump.regions:
++            if global_workspace_buffer is None or init_new_workspace:
++                global_workspace_buffer = bump.create_tensor(
++                    "runtime", (global_workspace_size,), torch.uint8)
+             self.workspace_buffer = global_workspace_buffer
++        else:
++            # Fallback: PyTorch allocator
++            if global_workspace_buffer is None:
++                global_workspace_buffer = torch.empty(
++                    global_workspace_size,
++                    dtype=torch.uint8,
++                    device=model_runner.device,
++                )
++            if init_new_workspace:
++                self.workspace_buffer = torch.empty(
++                    global_workspace_size,
++                    dtype=torch.uint8,
++                    device=model_runner.device,
++                )
++            else:
++                self.workspace_buffer = global_workspace_buffer
+         max_bs = model_runner.req_to_token_pool.size
+         if kv_indptr_buf is None:
+             self.kv_indptr = [
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index ce2711384..06249b7a6 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import (
+     BatchStrOutput,
+     BatchTokenIDOutput,
+     FreezeGCReq,
++    RegisterModelNotification,
+ )
+ from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
+ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+@@ -100,6 +101,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+         )
+ 
+     def init_tokenizer(self, server_args: ServerArgs):
++        self.model_tokenizers = {}  # model_name -> tokenizer
+         if server_args.skip_tokenizer_init:
+             self.tokenizer = None
+         else:
+@@ -109,6 +111,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+                 trust_remote_code=server_args.trust_remote_code,
+                 revision=server_args.revision,
+             )
++            model_name = server_args.served_model_name or server_args.model_path
++            self.model_tokenizers[model_name] = self.tokenizer
+ 
+     def init_running_status(self, server_args: ServerArgs):
+         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
+@@ -139,11 +143,29 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+         while True:
+             with self.soft_watchdog.disable():
+                 recv_obj = self.recv_from_scheduler.recv_pyobj()
++            if isinstance(recv_obj, RegisterModelNotification):
++                self._preload_tokenizer(recv_obj.model_name, recv_obj.model_path)
++                self.soft_watchdog.feed()
++                continue
+             output = self._request_dispatcher(recv_obj)
+             if output is not None:
+                 self.send_to_tokenizer.send_pyobj(output)
+             self.soft_watchdog.feed()
+ 
++    def _preload_tokenizer(self, model_name: str, model_path: str):
++        """Pre-load tokenizer in background thread (non-blocking)."""
++        if model_name in self.model_tokenizers:
++            return
++        import threading
++        def _load():
++            try:
++                tok = get_tokenizer(model_path)
++                self.model_tokenizers[model_name] = tok
++                logger.info(f"Detokenizer pre-cached tokenizer: {model_name}")
++            except Exception as e:
++                logger.warning(f"Failed to pre-cache tokenizer {model_name}: {e}")
++        threading.Thread(target=_load, daemon=True).start()
++
+     def trim_matched_stop(
+         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
+     ):
+@@ -319,6 +341,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+         return output_strs
+ 
+     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
++        # Multi-model: select tokenizer by model_name
++        _name = recv_obj.model_name
++        if _name and _name in self.model_tokenizers:
++            self.tokenizer = self.model_tokenizers[_name]
++
+         # If handling idle batch, set output_strs to [].
+         output_strs = (
+             self._decode_batch_token_id_output(recv_obj)
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index f09b81480..e56982415 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -219,6 +219,9 @@ class GenerateReqInput(BaseReq):
+     # Routing key for routing-key schedule policy
+     routing_key: Optional[str] = None
+ 
++    # Model name for multi-model serving
++    model_name: Optional[str] = None
++
+     # Whether to disallow logging for this request (e.g. due to ZDR)
+     no_logs: bool = False
+ 
+@@ -734,6 +737,9 @@ class TokenizedGenerateReqInput(BaseReq):
+     # Routing key for routing-key schedule policy
+     routing_key: Optional[str] = None
+ 
++    # Model name for multi-model serving
++    model_name: Optional[str] = None
++
+     # Whether to disallow logging for this request (e.g. due to ZDR)
+     no_logs: bool = False
+ 
+@@ -969,6 +975,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     skip_special_tokens: List[bool]
+     spaces_between_special_tokens: List[bool]
+     no_stop_trim: List[bool]
++    # Multi-model: detokenizer selects tokenizer by model_name
++    model_name: Optional[str] = None
+ 
+     # Token counts
+     prompt_tokens: List[int]
+@@ -1954,3 +1962,27 @@ def _check_all_req_types():
+ 
+ 
+ _check_all_req_types()
++
++
++# ── Model Hot-Switch ──
++
++@dataclass
++class RegisterModelReqInput(BaseReq):
++    """Register a new model for multi-model serving."""
++    model_name: str
++    model_path: str
++
++
++@dataclass
++class RegisterModelReqOutput(BaseReq):
++    success: bool
++    message: str = ""
++
++
++@dataclass
++class RegisterModelNotification:
++    """Sent from scheduler to detokenizer to pre-cache tokenizer."""
++    model_name: str
++    model_path: str
++
++
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d3defd259..080cba979 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
+     PauseGenerationReqInput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
++    RegisterModelReqInput,
+     ResumeMemoryOccupationReqInput,
+     RpcReqInput,
+     RpcReqOutput,
+@@ -380,6 +381,9 @@ class Scheduler(
+         # Init mamba backend
+         self.init_mamba_backend()
+ 
++        # Init CPU model cache before model worker (model_runner._load_model_bump needs it)
++        self.init_cpu_model_cache()
++
+         # Launch a model worker and draft model worker if using speculative decoding
+         self.init_model_worker()
+ 
+@@ -392,6 +396,9 @@ class Scheduler(
+         # Init running status
+         self.init_running_status()
+ 
++        # Init KV transfer for multi-model hot-switching
++        self.init_kv_transfer()
++
+         # Init chunked prefill
+         self.init_chunked_prefill()
+ 
+@@ -435,6 +442,7 @@ class Scheduler(
+ 
+     def init_model_config(self):
+         self.model_config = ModelConfig.from_server_args(self.server_args)
++        self.active_model_name = self.server_args.served_model_name or self.server_args.model_path
+         if _is_npu:
+             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
+             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
+@@ -628,6 +636,29 @@ class Scheduler(
+         self.init_tp_model_worker()
+         self.maybe_init_draft_worker()
+ 
++    def init_cpu_model_cache(self):
++        """Initialize global CPU model cache for multi-model hot-switching."""
++        if self.server_args.enable_bump_allocator:
++            from sglang.srt.mem_cache.cpu_model_cache import get_cpu_model_cache
++            self._cpu_model_cache = get_cpu_model_cache()
++            # Register startup model (load() will be called by model_runner._load_model_bump)
++            model_name = self.server_args.served_model_name or self.server_args.model_path
++            self._cpu_model_cache.register(model_name, self.server_args.model_path)
++        else:
++            self._cpu_model_cache = None
++
++    def init_kv_transfer(self):
++        """Initialize KV transfer for continuous D2H backup during hot-switching."""
++        if self.server_args.enable_bump_allocator:
++            from sglang.srt.mem_cache.kv_transfer import KVTransfer
++            self._kv_transfer = KVTransfer()
++        else:
++            self._kv_transfer = None
++        self._preload_thread = None
++        self._preload_manager = None
++        self._pending_switch = None
++        self._prev_model_name = None
++
+         # Dispatch the model worker
+         if self.spec_algorithm.is_none():
+             self.model_worker = self.tp_worker
+@@ -1205,6 +1236,7 @@ class Scheduler(
+                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
+                 (GetWeightsByNameReqInput, self.get_weights_by_name),
+                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
++                (RegisterModelReqInput, self.register_model),
+                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+                 (CheckWeightsReqInput, self.check_weights),
+                 (SlowDownReqInput, self.slow_down),
+@@ -1292,6 +1324,11 @@ class Scheduler(
+             else:
+                 # When the server is idle, do self-check and re-init some states.
+                 self.self_check_during_idle()
++                # Check for deferred model switch
++                self._execute_pending_switch()
++
++            # Check if a model needs preloading (non-blocking, runs in background thread)
++            self._check_preload()
+ 
+             # Update last_batch
+             self.last_batch = batch
+@@ -1696,6 +1733,11 @@ class Scheduler(
+         self,
+         recv_req: TokenizedGenerateReqInput,
+     ):
++        # ── Multi-model: check if model switch is needed ──
++        target = recv_req.model_name
++        logger.info(f"handle_generate_request: model_name={target}, active={self.active_model_name}")
++        if target and target != self.active_model_name:
++            self._prepare_model_switch(target)
+         # Route: normal request / session request / session-not-found
+         session_id = (
+             recv_req.session_params.id if recv_req.session_params is not None else None
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index e3b8dc87e..8dd329211 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -449,6 +449,24 @@ class SchedulerOutputProcessorMixin:
+             ):
+                 self.decode_offload_manager.offload_kv_cache(req)
+ 
++            # Decode step D2H: incrementally offload KV to CPU each decode step
++            _kv_offload = self._kv_transfer
++            if (
++                _kv_offload is not None
++                and not req.finished()
++                and self.server_args.enable_bump_allocator
++                and req.req_pool_idx is not None
++            ):
++                _runner = self.tp_worker.model_runner
++                _kv_offload.offload_incremental(
++                    req_pool_idx=req.req_pool_idx,
++                    kv_committed_len=req.kv_committed_len,
++                    model_name=self.active_model_name,
++                    kv_pool=_runner.token_to_kv_pool,
++                    num_layers=_runner.num_effective_layers,
++                    req_to_token_pool=self.tree_cache.req_to_token_pool,
++                )
++
+             if req.finished():
+                 # delete feature to save memory
+                 if req.multimodal_inputs is not None and req.session is None:
+@@ -460,9 +478,50 @@ class SchedulerOutputProcessorMixin:
+                     if not self.decode_offload_manager.offload_kv_cache(req):
+                         self.decode_offload_manager.finalize_release_on_finish(req)
+                 else:
++                    # Finalize incremental D2H (merge chunks) or fallback to batch offload
++                    _kv_offload = self._kv_transfer
++                    if _kv_offload is not None and req.req_pool_idx is not None:
++                        _kv_committed = req.kv_committed_len
++                        _model_name = self.active_model_name
++                        _token_ids = (req.origin_input_ids + req.output_ids)
++                        if req.req_pool_idx in _kv_offload._incremental:
++                            # Incremental D2H was active: finalize last chunk + merge
++                            _runner = self.tp_worker.model_runner
++                            _kv_offload.offload_incremental(
++                                req_pool_idx=req.req_pool_idx,
++                                kv_committed_len=_kv_committed,
++                                model_name=_model_name,
++                                kv_pool=_runner.token_to_kv_pool,
++                                num_layers=_runner.num_effective_layers,
++                                req_to_token_pool=self.tree_cache.req_to_token_pool,
++                            )
++                            _kv_offload.finalize_incremental(
++                                req_pool_idx=req.req_pool_idx,
++                                model_name=_model_name,
++                                token_ids=_token_ids,
++                                num_layers=_runner.num_effective_layers,
++                            )
++                        elif _kv_committed > 0:
++                            # Fallback: batch offload (no incremental was active)
++                            _input_len = len(req.origin_input_ids)
++                            _slot_indices = self.tree_cache.req_to_token_pool.req_to_token[
++                                req.req_pool_idx, :min(_input_len, _kv_committed)
++                            ]
++                            _runner = self.tp_worker.model_runner
++                            _kv_offload.offload(
++                                model_name=_model_name,
++                                token_ids=_token_ids[:min(_input_len, _kv_committed)],
++                                slot_indices=_slot_indices,
++                                kv_pool=_runner.token_to_kv_pool,
++                                num_layers=_runner.num_effective_layers,
++                            )
+                     if self.enable_hisparse:
+                         self.hisparse_coordinator.request_finished(req)
+-                    release_kv_cache(req, self.tree_cache)
++                    # Bump mode: always skip radix tree insert (eager slot reclaim).
++                    # KV data is already backed up to CPU via decode step D2H.
++                    # Slots go to LIFO front, keeping allocation compact on the left.
++                    _bump_mode = self.server_args.enable_bump_allocator
++                    release_kv_cache(req, self.tree_cache, is_insert=not _bump_mode)
+ 
+                 req.time_stats.set_completion_time()
+ 
+@@ -1166,6 +1225,8 @@ class SchedulerOutputProcessorMixin:
+                     retraction_counts=retraction_counts,
+                     load=load,
+                     dp_ranks=dp_ranks,
++                    model_name=self.active_model_name,
++                    model_path=self.server_args.model_path,
+                 )
+             )
+ 
+diff --git a/python/sglang/srt/managers/scheduler_update_weights_mixin.py b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+index abcda6794..ca4cf5a68 100644
+--- a/python/sglang/srt/managers/scheduler_update_weights_mixin.py
++++ b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+@@ -211,6 +211,162 @@ class SchedulerUpdateWeightsMixin:
+         )
+ 
+ 
++    def _prepare_model_switch(self: "Scheduler", target_model_name: str):
++        import time as _time
++        entry = self._cpu_model_cache.get_entry(target_model_name) if self._cpu_model_cache else None
++        if entry is None:
++            logger.warning(f"Model not registered: {target_model_name}")
++            return
++        self._switch_request_ts = _time.perf_counter()
++        self._pending_switch = (target_model_name, entry.path)
++        logger.info(f"Switch pending: {self.active_model_name} -> {target_model_name}")
++        # Preload will be triggered by _check_preload() in the scheduler loop
++
++    def _execute_pending_switch(self):
++        if self._pending_switch is not None and self.is_fully_idle():
++            name, path = self._pending_switch
++            self._execute_model_switch(name, path)
++
++    def _execute_model_switch(self, target_model_name, target_path):
++        import time as _time
++        from sglang.srt.managers.model_switch import do_model_switch_bump
++        _drain_done_ts = _time.perf_counter()
++        prev_model_name = self.active_model_name
++        logger.info(f"Auto-switching: {prev_model_name} -> {target_model_name}")
++        try:
++            timings = do_model_switch_bump(self, target_path, target_model_name)
++            self.active_model_name = target_model_name
++            self._prev_model_name = prev_model_name
++            # E2E timing
++            _req_ts = getattr(self, "_switch_request_ts", None)
++            if _req_ts is not None:
++                _e2e = _time.perf_counter() - _req_ts
++                _drain_ms = (_drain_done_ts - _req_ts) * 1000
++                _switch_ms = timings.get("total", 0) * 1000
++                logger.info(f"  E2E: drain={_drain_ms:.1f}ms switch={_switch_ms:.1f}ms total={_e2e*1000:.1f}ms")
++                self._switch_request_ts = None
++        except Exception as e:
++            logger.error(f"Auto-switch failed: {e}", exc_info=True)
++        finally:
++            self._pending_switch = None
++
++    def _check_preload(self: "Scheduler"):
++        """Check if a model needs preloading. Called from scheduler idle loop.
++
++        Priority:
++          1. Pending switch target (for upcoming switch)
++          2. Previous model (for switch-back after completed switch)
++        """
++        # Determine preload target
++        target = None
++        if self._pending_switch is not None:
++            target = self._pending_switch[0]
++        elif getattr(self, "_prev_model_name", None):
++            target = self._prev_model_name
++
++        if target is None or target == self.active_model_name:
++            return
++
++        # Already preloading?
++        if self._preload_thread is not None and self._preload_thread.is_alive():
++            return
++
++        # Already preloaded for this target?
++        if (self._preload_manager is not None
++                and self._preload_manager.model_name == target
++                and self._preload_manager.is_valid):
++            return
++
++        torch.cuda.synchronize()
++        self._start_weight_preload(target)
++
++    def register_model(self: "Scheduler", recv_req):
++        """Register a model for hot-switching.
++        Preloads model weights to CPU in background via cpu_model_cache."""
++        from sglang.srt.managers.io_struct import RegisterModelReqOutput
++
++        logger.info(f"Scheduler registered model: {recv_req.model_name} -> {recv_req.model_path}")
++
++        # Notify detokenizer to pre-load tokenizer for this model
++        if hasattr(self, "send_to_detokenizer"):
++            from sglang.srt.managers.io_struct import RegisterModelNotification
++            self.send_to_detokenizer.socket.send_pyobj(
++                RegisterModelNotification(model_name=recv_req.model_name, model_path=recv_req.model_path)
++            )
++
++        # Load model to CPU in background if bump allocator is enabled
++        if self._cpu_model_cache is not None:
++            self._cpu_model_cache.register(recv_req.model_name, recv_req.model_path)
++            self._cpu_model_cache.load(recv_req.model_name)
++
++        return RegisterModelReqOutput(success=True, message=f"Registered {recv_req.model_name}")
++
++
++    def _start_weight_preload(self: "Scheduler", target_model_name: str):
++        """Start background H2D of target model weights to GPU staging.
++
++        Scatter staging: weights are distributed into free tails of KV layer blocks.
++        Runs in a background thread so scheduler returns immediately.
++        """
++        import threading
++
++        # Skip if a preload thread is already running
++        _t = getattr(self, "_preload_thread", None)
++        if _t is not None and _t.is_alive():
++            logger.info(f"Preload already running, skip {target_model_name}")
++            return
++
++        bump = self.tp_worker.model_runner.bump_vram_manager
++        entry = self._cpu_model_cache.get_entry(target_model_name)
++        # TODO: non-blocking check + drain gate in get_next_batch_to_run
++        # Currently blocks scheduler if CPU load not done yet.
++        cpu_model, _ = self._cpu_model_cache.get_cpu_model(target_model_name)
++        cpu_state_dict = entry.cpu_state_dict
++
++        # Get KV pool and min_free_slot for scatter staging
++        kv_pool = self.tp_worker.model_runner.token_to_kv_pool
++        _allocator = self.token_to_kv_pool_allocator
++        # min(free_pages) = lowest free slot; staging uses rows above this
++        if len(_allocator.free_pages) > 0:
++            _min_free = _allocator.free_pages.min().item()
++        else:
++            # All slots allocated — staging capacity will be 0
++            _min_free = kv_pool.k_buffer[0].shape[0]
++
++        from sglang.srt.mem_cache.weight_staging import PreloadManager
++        if self._preload_manager is None:
++            self._preload_manager = PreloadManager()
++
++        preload_mgr = self._preload_manager
++
++        # Create shared lock for thread-safe free_pages access
++        _alloc_lock = threading.Lock()
++        _allocator._staging_lock = _alloc_lock
++
++        def _do_preload():
++            try:
++                sd = {k: v.contiguous() for k, v in cpu_state_dict.items()}
++
++                preload_mgr.start_preload(
++                    model_name=target_model_name,
++                    cpu_state_dict=sd,
++                    bump=bump,
++                    kv_pool=kv_pool,
++                    min_free_slot=_min_free,
++                    allocator=_allocator,
++                    alloc_lock=_alloc_lock,
++                )
++            except Exception as e:
++                logger.error(f"Preload thread error: {e}", exc_info=True)
++            finally:
++                # Remove lock after preload completes — no contention outside preload
++                _allocator._staging_lock = None
++
++        self._preload_thread = threading.Thread(target=_do_preload, daemon=True)
++        self._preload_thread.start()
++        logger.info(f"_start_weight_preload: background thread started for {target_model_name}")
++
++
+ def _export_static_state(model):
+     return dict(
+         buffers=[
+diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+index 544c60940..e9ed7689a 100644
+--- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+@@ -63,7 +63,9 @@ from sglang.srt.managers.io_struct import (
+     ProfileReqOutput,
+     ProfileReqType,
+     ReleaseMemoryOccupationReqInput,
++    RegisterModelReqInput,
+     ReleaseMemoryOccupationReqOutput,
++    RegisterModelReqOutput,
+     ResumeMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqOutput,
+     SendWeightsToRemoteInstanceReqInput,
+@@ -193,6 +195,9 @@ class TokenizerCommunicatorMixin:
+         self.release_memory_occupation_communicator = _Communicator(
+             self.send_to_scheduler, server_args.dp_size
+         )
++        self.register_model_communicator = _Communicator(
++            self.send_to_scheduler, server_args.dp_size
++        )
+         self.resume_memory_occupation_communicator = _Communicator(
+             self.send_to_scheduler, server_args.dp_size
+         )
+@@ -280,6 +285,10 @@ class TokenizerCommunicatorMixin:
+                     ReleaseMemoryOccupationReqOutput,
+                     self.release_memory_occupation_communicator.handle_recv,
+                 ),
++                (
++                    RegisterModelReqOutput,
++                    self.register_model_communicator.handle_recv,
++                ),
+                 (
+                     ResumeMemoryOccupationReqOutput,
+                     self.resume_memory_occupation_communicator.handle_recv,
+@@ -966,3 +975,18 @@ class TokenizerCommunicatorMixin:
+         """Update weight version if provided."""
+         if weight_version is not None:
+             self.server_args.weight_version = weight_version
++
++
++    async def register_model(
++        self: TokenizerManager,
++        obj: RegisterModelReqInput,
++        request=None,
++    ):
++        """Register a model: load tokenizer locally + notify scheduler."""
++        self.auto_create_handle_loop()
++        # 1. Register tokenizer locally in TokenizerManager
++        local_result = self.register_model_local(obj.model_name, obj.model_path)
++        if not local_result["success"]:
++            return local_result
++        # 2. Notify scheduler to register the model path mapping
++        return await self.register_model_communicator(obj)
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 011fd9cc0..6a88b409b 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -223,6 +223,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+         # Init request dispatcher
+         self.init_request_dispatcher()
+ 
++        # Multi-model: tokenizer cache {model_name -> tokenizer}
++        model_name = self.served_model_name or self.model_path
++        self.model_tokenizers = {model_name: self.tokenizer}
++
+     def init_model_config(self):
+         server_args = self.server_args
+         model_config_class = getattr(self, "model_config_class", ModelConfig)
+@@ -507,6 +511,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+ 
+         async with self.model_update_lock.reader_lock:
++            # Multi-model: use target model's tokenizer
++            model_name = getattr(obj, "model_name", None)
++            if model_name and model_name in self.model_tokenizers:
++                self.tokenizer = self.model_tokenizers[model_name]
++
+             await self._validate_and_resolve_lora(obj)
+ 
+             # Tokenize the request and send it to the scheduler
+@@ -973,6 +982,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+                 routing_key=obj.routing_key,
+                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                 num_items_assigned=obj.num_items_assigned,
++                model_name=getattr(obj, "model_name", None),
+             )
+         elif isinstance(obj, EmbeddingReqInput):
+             tokenized_obj = TokenizedEmbeddingReqInput(
+@@ -2475,6 +2485,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
+         ):
+             obj.priority = self.default_priority_value
+ 
++    def register_model_local(self, model_name: str, model_path: str) -> dict:
++        """Register a new model's tokenizer locally."""
++        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
++        try:
++            new_tokenizer = get_tokenizer(
++                model_path,
++                tokenizer_mode=self.server_args.tokenizer_mode,
++                trust_remote_code=self.server_args.trust_remote_code,
++            )
++            self.model_tokenizers[model_name] = new_tokenizer
++            return {"success": True, "message": f"Model {model_name} registered"}
++        except Exception as e:
++            return {"success": False, "message": str(e)}
++
+ 
+ class ServerStatus(Enum):
+     Up = "Up"
+diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
+index c0ce15e20..ce147f6b6 100644
+--- a/python/sglang/srt/mem_cache/allocator.py
++++ b/python/sglang/srt/mem_cache/allocator.py
+@@ -124,8 +124,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+         device: str,
+         kvcache: KVCache,
+         need_sort: bool,
++        lifo_mode: bool = False,
+     ):
+         super().__init__(size, 1, dtype, device, kvcache, need_sort)
++        self._lifo_mode = lifo_mode
++        self._staging_lock = None  # set during preload for thread-safe free_pages access
+         self.clear()
+ 
+     def clear(self):
+@@ -142,27 +145,40 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+         return len(self.free_pages) + len(self.release_pages)
+ 
+     def alloc(self, need_size: int):
+-        if self.need_sort and need_size > len(self.free_pages):
+-            self.merge_and_sort_free()
++        _lk = self._staging_lock
++        if _lk: _lk.acquire()
++        try:
++            if self.need_sort and need_size > len(self.free_pages):
++                self.merge_and_sort_free()
+ 
+-        if need_size > len(self.free_pages):
+-            return None
++            if need_size > len(self.free_pages):
++                return None
+ 
+-        select_index = self.free_pages[:need_size]
+-        self.free_pages = self.free_pages[need_size:]
+-        return select_index
++            select_index = self.free_pages[:need_size]
++            self.free_pages = self.free_pages[need_size:]
++            return select_index
++        finally:
++            if _lk: _lk.release()
+ 
+     def free(self, free_index: torch.Tensor):
+         if free_index.numel() == 0:
+             return
+ 
+-        if self.is_not_in_free_group:
+-            if self.need_sort:
+-                self.release_pages = torch.cat((self.release_pages, free_index))
++        _lk = self._staging_lock
++        if _lk: _lk.acquire()
++        try:
++            if self.is_not_in_free_group:
++                if self.need_sort:
++                    self.release_pages = torch.cat((self.release_pages, free_index))
++                elif self._lifo_mode:
++                    # LIFO: prepend freed slots so they are reused first.
++                    self.free_pages = torch.cat((free_index, self.free_pages))
++                else:
++                    self.free_pages = torch.cat((self.free_pages, free_index))
+             else:
+-                self.free_pages = torch.cat((self.free_pages, free_index))
+-        else:
+-            self.free_group.append(free_index)
++                self.free_group.append(free_index)
++        finally:
++            if _lk: _lk.release()
+ 
+     def get_cpu_copy(self, indices):
+         return self._kvcache.get_cpu_copy(indices)
+diff --git a/python/sglang/srt/mem_cache/bump_vram_manager.py b/python/sglang/srt/mem_cache/bump_vram_manager.py
+new file mode 100644
+index 000000000..92483f435
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/bump_vram_manager.py
+@@ -0,0 +1,184 @@
++"""
++Page-based bump allocator for self-managed GPU VRAM.
++
++Layout: [weights(left) | kv_cache(middle) | runtime(right)]
++Release = pointer move, O(1), zero GC.
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass
++from math import prod
++from typing import Dict, List, Optional, Tuple
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_ALIGNMENT = 256
++
++_DTYPE_SIZES = {
++    torch.float16: 2,
++    torch.bfloat16: 2,
++    torch.float32: 4,
++    torch.float64: 8,
++    torch.int8: 1,
++    torch.uint8: 1,
++    torch.int32: 4,
++    torch.int64: 8,
++}
++
++
++def _align_up(n: int, alignment: int = _ALIGNMENT) -> int:
++    return (n + alignment - 1) & ~(alignment - 1)
++
++
++@dataclass
++class BumpRegion:
++    tag: str
++    start: int
++    capacity: int
++    _sub_offset: int = 0
++
++    def reset(self, new_capacity=None):
++        if new_capacity is not None:
++            self.capacity = _align_up(new_capacity)
++        self._sub_offset = 0
++
++    @property
++    def used_bytes(self):
++        return self._sub_offset
++
++    @property
++    def free_bytes(self):
++        return self.capacity - self._sub_offset
++
++
++@dataclass
++class LayerSlice:
++    name: str
++    offset: int
++    nbytes: int
++
++
++class BumpVramAllocator:
++    def __init__(self, total_bytes: int, device: str = "cuda"):
++        self.total_bytes = _align_up(total_bytes)
++        self.device = device
++        self.buffer = torch.empty(self.total_bytes, dtype=torch.uint8, device=device)
++        self.left_offset = 0
++        self.right_offset = self.total_bytes
++        self.regions: Dict[str, BumpRegion] = {}
++        self.layer_map: Dict[str, List[LayerSlice]] = {}
++        self._current_model: Optional[str] = None
++        logger.info(
++            f"BumpVramAllocator: allocated {self.total_bytes / 1024**3:.2f} GB "
++            f"managed buffer on {device}"
++        )
++
++    def allocate_region(self, tag: str, size_bytes: int) -> BumpRegion:
++        if tag in self.regions:
++            raise ValueError(f"Region '{tag}' already exists. Use reset_region().")
++        aligned_size = _align_up(size_bytes)
++        if tag == "runtime":
++            new_right = self.right_offset - aligned_size
++            if new_right < self.left_offset:
++                raise RuntimeError(
++                    f"BumpVramAllocator OOM: need {aligned_size} for '{tag}', "
++                    f"avail {self.right_offset - self.left_offset}"
++                )
++            region = BumpRegion(tag=tag, start=new_right, capacity=aligned_size)
++            self.right_offset = new_right
++        else:
++            if self.left_offset + aligned_size > self.right_offset:
++                raise RuntimeError(
++                    f"BumpVramAllocator OOM: need {aligned_size} for '{tag}', "
++                    f"avail {self.right_offset - self.left_offset}"
++                )
++            region = BumpRegion(tag=tag, start=self.left_offset, capacity=aligned_size)
++            self.left_offset += aligned_size
++        self.regions[tag] = region
++        logger.info(
++            f"  Region '{tag}': {aligned_size / 1024**2:.1f} MB "
++            f"@ offset {region.start} "
++            f"(left={self.left_offset / 1024**3:.2f}GB, "
++            f"right={self.right_offset / 1024**3:.2f}GB, "
++            f"kv_avail={self.get_available_bytes() / 1024**3:.2f}GB)"
++        )
++        return region
++
++    def release_region(self, tag: str):
++        if tag not in self.regions:
++            logger.warning(f"release_region: '{tag}' not found, skipping")
++            return
++        region = self.regions[tag]
++        if tag == "runtime":
++            self.right_offset = region.start + region.capacity
++        else:
++            self.left_offset = region.start
++        del self.regions[tag]
++        logger.info(f"  Region '{tag}' released")
++
++    def reset_region(self, tag: str, new_capacity=None):
++        if tag not in self.regions:
++            return self.allocate_region(tag, new_capacity or 0)
++        region = self.regions[tag]
++        if tag == "runtime":
++            self.right_offset = region.start + region.capacity
++            del self.regions[tag]
++            return self.allocate_region(tag, new_capacity or 0)
++        if new_capacity is not None:
++            new_aligned = _align_up(new_capacity)
++            if new_aligned != region.capacity:
++                # weights is always at stack bottom (offset 0), resize in-place
++                assert region.start + region.capacity == self.left_offset, \
++                    f"Can only resize topmost left region, but '{tag}' is not at top"
++                self.left_offset = region.start + new_aligned
++                region.capacity = new_aligned
++        region.reset(new_capacity)
++        logger.info(f"  Region '{tag}' reset: capacity={region.capacity / 1024**2:.1f} MB")
++        return region
++
++    def create_tensor(
++        self, tag: str, shape: Tuple[int, ...], dtype: torch.dtype, name: Optional[str] = None
++    ) -> torch.Tensor:
++        region = self.regions[tag]
++        elem_size = _DTYPE_SIZES.get(dtype, torch.tensor([], dtype=dtype).element_size())
++        numel = prod(shape)
++        nbytes = _align_up(numel * elem_size)
++        if region._sub_offset + nbytes > region.capacity:
++            raise RuntimeError(
++                f"Region '{tag}' sub-alloc OOM: need {nbytes}, "
++                f"free {region.free_bytes} (cap={region.capacity}, used={region._sub_offset})"
++            )
++        buf_start = region.start + region._sub_offset
++        buf_end = buf_start + numel * elem_size
++        raw = self.buffer[buf_start:buf_end]
++        tensor = raw.view(dtype).reshape(shape)
++        region._sub_offset += nbytes
++        if tag == "weights" and name and self._current_model:
++            self.layer_map.setdefault(self._current_model, []).append(
++                LayerSlice(name=name, offset=buf_start, nbytes=numel * elem_size)
++            )
++        return tensor
++
++    def get_available_bytes(self) -> int:
++        return self.right_offset - self.left_offset
++
++    def get_layer_map(self, model_name: str) -> List[LayerSlice]:
++        return self.layer_map.get(model_name, [])
++
++    def __repr__(self):
++        region_strs = []
++        for tag, r in sorted(self.regions.items(), key=lambda x: x[1].start):
++            region_strs.append(
++                f"  {tag}: {r.capacity/1024**2:.1f}MB @ {r.start}, "
++                f"used={r._sub_offset/1024**2:.1f}MB"
++            )
++        return (
++            f"BumpVramAllocator(total={self.total_bytes/1024**3:.2f}GB, "
++            f"left={self.left_offset/1024**3:.2f}GB, "
++            f"right={self.right_offset/1024**3:.2f}GB, "
++            f"kv_avail={self.get_available_bytes()/1024**3:.2f}GB)\n" + "\n".join(region_strs)
++        )
+diff --git a/python/sglang/srt/mem_cache/cpu_model_cache.py b/python/sglang/srt/mem_cache/cpu_model_cache.py
+new file mode 100644
+index 000000000..5f1c573b3
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/cpu_model_cache.py
+@@ -0,0 +1,135 @@
++"""CPU model cache for multi-model hot-switching.
++
++Loads model weights from disk into pinned CPU memory in a background thread.
++On model switch, the cached CPU model provides fast H2D transfer (~50 GB/s).
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++from dataclasses import dataclass
++from typing import Any, Dict, Optional
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class CpuModelEntry:
++    """Cached CPU model entry."""
++    name: str
++    path: str
++    cpu_model: Any = None           # nn.Module on CPU (pinned)
++    cpu_model_config: Any = None    # ModelConfig
++    cpu_state_dict: Any = None      # {name: pinned_tensor} zero-copy refs
++    _load_thread: Any = None
++    _load_error: Optional[str] = None
++
++
++class CpuModelCache:
++    """Cache of CPU models for hot-switching.
++
++    register() stores an entry. Call load() to start background disk → pinned CPU loading.
++    get_cpu_model() returns the cached model (blocks if loading still running).
++    """
++
++    def __init__(self):
++        self._models: Dict[str, CpuModelEntry] = {}
++
++    def register(self, name: str, path: str) -> None:
++        """Register a model entry. Call load() separately to start background disk loading."""
++        entry = CpuModelEntry(name=name, path=path)
++        self._models[name] = entry
++        logger.info(f"Model registered: {name} -> {path}")
++
++    def load(self, name: str):
++        """Start background thread to load model from disk into pinned CPU memory."""
++        entry = self._models.get(name)
++        if entry is None:
++            return
++        if entry._load_thread is not None and entry._load_thread.is_alive():
++            return  # already loading
++
++        def _do_load():
++            try:
++                import time as _time
++                import torch
++                from sglang.srt.model_loader.loader import (
++                    DefaultModelLoader, get_model_loader,
++                    _initialize_model, _get_quantization_config, set_default_torch_dtype,
++                )
++                from sglang.srt.configs.load_config import LoadConfig
++                from sglang.srt.configs.model_config import ModelConfig
++                from sglang.srt.server_args import get_global_server_args
++
++                logger.info(f"CPU load started: {entry.name} ({entry.path})")
++                server_args = get_global_server_args()
++                model_config = ModelConfig.from_server_args(server_args, model_path=entry.path)
++                load_config = LoadConfig(
++                    load_format=server_args.load_format,
++                    download_dir=server_args.download_dir,
++                    model_loader_extra_config=server_args.model_loader_extra_config,
++                )
++                quant_config = _get_quantization_config(model_config, load_config)
++
++                with set_default_torch_dtype(model_config.dtype):
++                    with torch.device("cpu"):
++                        model = _initialize_model(model_config, load_config, quant_config)
++
++                    # Bulk pin: single cudaHostAlloc, params point to views
++                    _t0 = _time.perf_counter()
++                    _total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
++                    _pin_buf = torch.empty(_total_bytes, dtype=torch.uint8, pin_memory=True)
++                    _offset = 0
++                    for p in model.parameters():
++                        _nbytes = p.numel() * p.element_size()
++                        p.data = _pin_buf[_offset:_offset + _nbytes].view(p.dtype).reshape(p.shape)
++                        _offset += _nbytes
++                    model._pinned_weight_buffer = _pin_buf
++
++                    loader = get_model_loader(load_config=load_config, model_config=model_config)
++                    weights = loader._get_all_weights(model_config, model)
++                    DefaultModelLoader.load_weights_and_postprocess(model, weights, torch.device("cpu"))
++
++                model.eval()
++
++                entry.cpu_model = model
++                entry.cpu_model_config = model_config
++                entry.cpu_state_dict = dict(model.state_dict())
++
++                _t1 = _time.perf_counter()
++                logger.info(f"CPU load done: {entry.name}, {_total_bytes/1024**2:.0f}MB, {(_t1-_t0)*1000:.0f}ms")
++            except Exception as e:
++                logger.exception(f"CPU load failed: {entry.name}")
++                entry._load_error = str(e)
++
++        t = threading.Thread(target=_do_load, daemon=True)
++        entry._load_thread = t
++        t.start()
++
++    def get_cpu_model(self, name: str):
++        """Get cached CPU model. Blocks if loading still running."""
++        entry = self._models.get(name)
++        if entry is None:
++            raise KeyError(f"Model '{name}' not registered")
++        if entry._load_thread is not None and entry._load_thread.is_alive():
++            logger.info(f"Waiting for CPU load: {name}")
++            entry._load_thread.join()
++        if entry._load_error:
++            raise RuntimeError(f"CPU load failed for '{name}': {entry._load_error}")
++        return entry.cpu_model, entry.cpu_model_config
++
++    def get_entry(self, name: str) -> Optional[CpuModelEntry]:
++        return self._models.get(name)
++
++
++# Global singleton
++_global_cache: Optional[CpuModelCache] = None
++
++
++def get_cpu_model_cache() -> CpuModelCache:
++    """Get or create the global CpuModelCache singleton."""
++    global _global_cache
++    if _global_cache is None:
++        _global_cache = CpuModelCache()
++    return _global_cache
+diff --git a/python/sglang/srt/mem_cache/kv_transfer.py b/python/sglang/srt/mem_cache/kv_transfer.py
+new file mode 100644
+index 000000000..6aa6bc18c
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/kv_transfer.py
+@@ -0,0 +1,218 @@
++"""
++KV cache offload manager: continuous D2H backup of finished request KV data.
++
++CPU backup is used when switching models destroys GPU KV cache.
++On switch-back, entries are staged to bump buffer and D2D restored.
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional, Tuple
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class KVEntry:
++    token_ids: torch.Tensor  # [seq_len] CPU, int64
++    slot_indices: torch.Tensor  # [seq_len] CPU, int64 (original GPU slot indices)
++    kv_data: list  # [layer_num] of (k_cpu, v_cpu) tuples
++    num_tokens: int
++    cell_bytes: int  # bytes per slot across all layers (for staging budget)
++
++    @property
++    def total_bytes(self) -> int:
++        return self.num_tokens * self.cell_bytes
++
++
++class KVTransfer:
++    """Manages continuous D2H offload of finished KV cache entries per model."""
++
++    def __init__(self):
++        self._store: Dict[str, Dict[tuple, KVEntry]] = {}
++        self._d2h_stream = torch.cuda.Stream()
++        self._cell_bytes_cache: Dict[str, int] = {}
++        self._incremental: Dict[int, int] = {}
++        self._incremental_kv: Dict[int, Dict[int, list]] = {}
++
++    def offload(
++        self,
++        model_name: str,
++        token_ids: list,
++        slot_indices: torch.Tensor,
++        kv_pool,
++        num_layers: int,
++    ):
++        """D2H offload slots to CPU. Runs on d2h_stream (non-blocking).
++
++        Args:
++            model_name: model this KV belongs to
++            token_ids: list of int token ids for this sequence
++            slot_indices: [seq_len] GPU tensor, KV pool slot indices
++            kv_pool: MHATokenToKVPool with k_buffer/v_buffer
++            num_layers: number of KV layers
++        """
++        seq_len = len(slot_indices)
++        if seq_len == 0:
++            return
++
++        token_ids_cpu = torch.tensor(token_ids, dtype=torch.int64)
++        slot_indices_cpu = slot_indices.cpu()
++
++        # Compute cell_bytes: bytes per token across all layers (cached per model)
++        if model_name in self._cell_bytes_cache:
++            cell_bytes = self._cell_bytes_cache[model_name]
++        else:
++            cell_bytes = 0
++            for layer_id in range(num_layers):
++                k_buf = kv_pool.k_buffer[layer_id]
++                v_buf = kv_pool.v_buffer[layer_id]
++                # k_buf shape: [pool_size, num_heads, head_dim]
++                cell_bytes += k_buf[0].numel() * k_buf[0].element_size()
++                cell_bytes += v_buf[0].numel() * v_buf[0].element_size()
++            self._cell_bytes_cache[model_name] = cell_bytes
++
++        kv_data = []
++        self._d2h_stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(self._d2h_stream):
++            for layer_id in range(num_layers):
++                k_cpu = kv_pool.k_buffer[layer_id][slot_indices].to("cpu", non_blocking=True)
++                v_cpu = kv_pool.v_buffer[layer_id][slot_indices].to("cpu", non_blocking=True)
++                kv_data.append((k_cpu, v_cpu))
++        self._d2h_stream.synchronize()
++
++        entry = KVEntry(
++            token_ids=token_ids_cpu,
++            slot_indices=slot_indices_cpu,
++            kv_data=kv_data,
++            num_tokens=seq_len,
++            cell_bytes=cell_bytes,
++        )
++
++        if model_name not in self._store:
++            self._store[model_name] = {}
++        # Dedup by token_ids: same prompt only keeps latest entry
++        key = tuple(entry.token_ids.tolist())
++        self._store[model_name][key] = entry
++
++        logger.debug(
++            f"KV offload: {model_name}, {seq_len} tokens, "
++            f"{entry.total_bytes / 1024:.1f}KB, "
++            f"total entries={len(self._store[model_name])}"
++        )
++
++    def offload_incremental(self, req_pool_idx, kv_committed_len, model_name, kv_pool, num_layers, req_to_token_pool):
++        last_pos = self._incremental.get(req_pool_idx, 0)
++        if kv_committed_len <= last_pos:
++            return
++        new_indices = req_to_token_pool.req_to_token[req_pool_idx, last_pos:kv_committed_len]
++        if new_indices.numel() == 0:
++            return
++        if model_name not in self._cell_bytes_cache:
++            cell_bytes = 0
++            for lid in range(num_layers):
++                cell_bytes += kv_pool.k_buffer[lid][0].numel() * kv_pool.k_buffer[lid][0].element_size()
++                cell_bytes += kv_pool.v_buffer[lid][0].numel() * kv_pool.v_buffer[lid][0].element_size()
++            self._cell_bytes_cache[model_name] = cell_bytes
++        if req_pool_idx not in self._incremental_kv:
++            self._incremental_kv[req_pool_idx] = {lid: [] for lid in range(num_layers)}
++        self._d2h_stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(self._d2h_stream):
++            for lid in range(num_layers):
++                k_cpu = kv_pool.k_buffer[lid][new_indices].to("cpu", non_blocking=True)
++                v_cpu = kv_pool.v_buffer[lid][new_indices].to("cpu", non_blocking=True)
++                self._incremental_kv[req_pool_idx][lid].append((k_cpu, v_cpu))
++        self._incremental[req_pool_idx] = kv_committed_len
++
++    def finalize_incremental(self, req_pool_idx, model_name, token_ids, num_layers):
++        inc_kv = self._incremental_kv.pop(req_pool_idx, None)
++        last_pos = self._incremental.pop(req_pool_idx, 0)
++        if inc_kv is None or last_pos == 0:
++            return
++        self._d2h_stream.synchronize()
++        kv_data = []
++        for lid in range(num_layers):
++            chunks = inc_kv.get(lid, [])
++            if chunks:
++                kv_data.append((torch.cat([c[0] for c in chunks], dim=0),
++                                torch.cat([c[1] for c in chunks], dim=0)))
++            else:
++                kv_data.append((torch.empty(0), torch.empty(0)))
++        cell_bytes = self._cell_bytes_cache.get(model_name, 0)
++        entry = KVEntry(
++            token_ids=torch.tensor(token_ids[:last_pos], dtype=torch.int64),
++            slot_indices=torch.empty(0, dtype=torch.int64),
++            kv_data=kv_data, num_tokens=last_pos, cell_bytes=cell_bytes,
++        )
++        if model_name not in self._store:
++            self._store[model_name] = {}
++        self._store[model_name][tuple(token_ids[:last_pos])] = entry
++        logger.debug(f"KV offload finalized: {model_name}, {last_pos} tokens")
++
++    def cancel_incremental(self, req_pool_idx):
++        self._incremental.pop(req_pool_idx, None)
++        self._incremental_kv.pop(req_pool_idx, None)
++
++    def wait_offload(self):
++        """Block until all pending D2H transfers complete."""
++        self._d2h_stream.synchronize()
++
++    def _entries(self, model_name: str) -> List[KVEntry]:
++        store = self._store.get(model_name, {})
++        return list(store.values())
++
++    def get_entries(self, model_name: str) -> List[KVEntry]:
++        return self._entries(model_name)
++
++    def get_hit_entries(
++        self,
++        model_name: str,
++        pending_token_ids_list: Optional[List[list]] = None,
++    ) -> List[KVEntry]:
++        """Return entries whose token_ids prefix-match pending requests.
++
++        If pending_token_ids_list is None, return all entries for the model.
++        Otherwise, return entries where entry.token_ids is a prefix of any
++        pending request's token_ids.
++        """
++        entries = self._entries(model_name)
++        if not entries:
++            return []
++        if pending_token_ids_list is None:
++            return entries
++
++        hits = []
++        for entry in entries:
++            entry_ids = entry.token_ids.tolist()
++            entry_len = len(entry_ids)
++            for pending_ids in pending_token_ids_list:
++                if len(pending_ids) >= entry_len and pending_ids[:entry_len] == entry_ids:
++                    hits.append(entry)
++                    break
++        return hits
++
++    def get_total_bytes(self, entries: List[KVEntry]) -> int:
++        return sum(e.total_bytes for e in entries)
++
++    def has_data(self, model_name: str) -> bool:
++        return bool(self._store.get(model_name, {}))
++
++    def clear_model(self, model_name: str):
++        if model_name in self._store:
++            count = len(self._store[model_name])
++            del self._store[model_name]
++            logger.debug(f"KV offload: cleared {count} entries for {model_name}")
++
++    def stats(self, model_name: str) -> dict:
++        entries = self._entries(model_name)
++        total_tokens = sum(e.num_tokens for e in entries)
++        total_bytes = sum(e.total_bytes for e in entries)
++        return {
++            "entries": len(entries),
++            "total_tokens": total_tokens,
++            "total_bytes": total_bytes,
++        }
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index df5d54223..91b880aa2 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -755,7 +755,9 @@ class MHATokenToKVPool(KVCache):
+         end_layer: Optional[int] = None,
+         enable_alt_stream: bool = True,
+         enable_kv_cache_copy: bool = False,
++        bump_vram_manager=None,
+     ):
++        self.bump_vram_manager = bump_vram_manager
+         super().__init__(
+             size,
+             page_size,
+@@ -840,30 +842,56 @@ class MHATokenToKVPool(KVCache):
+         )
+ 
+     def _create_buffers(self):
+-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+-            with (
+-                torch.cuda.use_mem_pool(self.custom_mem_pool)
+-                if self.enable_custom_mem_pool
+-                else nullcontext()
+-            ):
+-                # [size, head_num, head_dim] for each layer
+-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+-                self.k_buffer = [
+-                    torch.zeros(
+-                        (self.size + self.page_size, self.head_num, self.head_dim),
+-                        dtype=self.store_dtype,
+-                        device=self.device,
+-                    )
+-                    for _ in range(self.layer_num)
+-                ]
+-                self.v_buffer = [
+-                    torch.zeros(
+-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
+-                        dtype=self.store_dtype,
+-                        device=self.device,
+-                    )
+-                    for _ in range(self.layer_num)
+-                ]
++        bump = getattr(self, "bump_vram_manager", None)
++        if bump is not None:
++            # Allocate KV cache from bump buffer
++            k_shape = (self.size + self.page_size, self.head_num, self.head_dim)
++            v_shape = (self.size + self.page_size, self.head_num, self.v_head_dim)
++            # Allocate kv_cache region if not already done
++            total_kv_bytes = 0
++            elem_size = torch.tensor([], dtype=self.store_dtype).element_size()
++            from math import prod
++            total_kv_bytes += prod(k_shape) * elem_size * self.layer_num
++            total_kv_bytes += prod(v_shape) * elem_size * self.layer_num
++            if "kv_cache" not in bump.regions:
++                bump.allocate_region("kv_cache", total_kv_bytes)
++            else:
++                bump.reset_region("kv_cache", total_kv_bytes)
++            self.k_buffer = []
++            self.v_buffer = []
++            for _ in range(self.layer_num):
++                k = bump.create_tensor("kv_cache", k_shape, self.store_dtype)
++                k.zero_()
++                self.k_buffer.append(k)
++            for _ in range(self.layer_num):
++                v = bump.create_tensor("kv_cache", v_shape, self.store_dtype)
++                v.zero_()
++                self.v_buffer.append(v)
++        else:
++            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
++                with (
++                    torch.cuda.use_mem_pool(self.custom_mem_pool)
++                    if self.enable_custom_mem_pool
++                    else nullcontext()
++                ):
++                    # [size, head_num, head_dim] for each layer
++                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
++                    self.k_buffer = [
++                        torch.zeros(
++                            (self.size + self.page_size, self.head_num, self.head_dim),
++                            dtype=self.store_dtype,
++                            device=self.device,
++                        )
++                        for _ in range(self.layer_num)
++                    ]
++                    self.v_buffer = [
++                        torch.zeros(
++                            (self.size + self.page_size, self.head_num, self.v_head_dim),
++                            dtype=self.store_dtype,
++                            device=self.device,
++                        )
++                        for _ in range(self.layer_num)
++                    ]
+ 
+         self.k_data_ptrs = torch.tensor(
+             [x.data_ptr() for x in self.k_buffer],
+@@ -945,21 +973,22 @@ class MHATokenToKVPool(KVCache):
+         return kv_cache_cpu
+ 
+     def load_cpu_copy(self, kv_cache_cpu, indices):
+-        torch.cuda.synchronize()
++        h2d_stream = torch.cuda.Stream()
+         chunk_size = self.cpu_offloading_chunk_size
+-        for layer_id in range(self.layer_num):
+-            for i in range(0, len(indices), chunk_size):
+-                chunk_indices = indices[i : i + chunk_size]
+-                k_cpu, v_cpu = (
+-                    kv_cache_cpu[layer_id][i // chunk_size][0],
+-                    kv_cache_cpu[layer_id][i // chunk_size][1],
+-                )
+-                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
+-                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
+-                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
+-                self.k_buffer[layer_id][chunk_indices] = k_chunk
+-                self.v_buffer[layer_id][chunk_indices] = v_chunk
+-        torch.cuda.synchronize()
++        with torch.cuda.stream(h2d_stream):
++            for layer_id in range(self.layer_num):
++                for i in range(0, len(indices), chunk_size):
++                    chunk_indices = indices[i : i + chunk_size]
++                    k_cpu, v_cpu = (
++                        kv_cache_cpu[layer_id][i // chunk_size][0],
++                        kv_cache_cpu[layer_id][i // chunk_size][1],
++                    )
++                    k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
++                    v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
++                    self.k_buffer[layer_id][chunk_indices] = k_chunk
++                    self.v_buffer[layer_id][chunk_indices] = v_chunk
++        h2d_stream.synchronize()
++
+ 
+     def _get_key_buffer(self, layer_id: int):
+         # for internal use of referencing
+diff --git a/python/sglang/srt/mem_cache/weight_staging.py b/python/sglang/srt/mem_cache/weight_staging.py
+new file mode 100644
+index 000000000..e0fbe2e31
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/weight_staging.py
+@@ -0,0 +1,342 @@
++"""
++Scatter staging: background H2D of next model's weights into KV layer block free tails.
++
++Instead of writing contiguous bytes at the KV region tail (which corrupts active KV),
++staging distributes weight bytes across the free high-index rows of each KV layer block.
++LIFO slot allocation keeps active slots at low indices, ensuring staging doesn't overlap.
++
++Layout per block:
++  [active rows 0..min_free-1 | gap | staging rows S..pool_size-1]
++
++H2D proceeds top-down (highest rows first) across ALL blocks simultaneously.
++Each round locks only the current chunk of rows, syncs, then unlocks.
++Previously staged rows may be overwritten by KV — verify_integrity detects this.
++
++D2D gather at switch time: num_blocks copies → contiguous weights region (~21ms for 62GB).
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++import threading
++from dataclasses import dataclass
++from typing import List, Optional, TYPE_CHECKING
++
++import torch
++import torch.cuda
++
++if TYPE_CHECKING:
++    from sglang.srt.mem_cache.bump_vram_manager import BumpVramAllocator
++
++logger = logging.getLogger(__name__)
++
++H2D_CHUNK_SIZE = 32 * 1024 * 1024  # 32MB per block per round
++
++
++@dataclass
++class ScatterStagingInfo:
++    """Metadata for scatter-staged weights across KV layer blocks."""
++    staging_start: int           # first staging row in each block
++    staging_rows: int            # number of staging rows per block
++    staged_per_block: int        # weight bytes stored per block
++    num_blocks: int              # total KV layer blocks (num_layers * 2)
++    total_staged_bytes: int      # total weight bytes actually staged
++    row_size: int                # bytes per row (uniform across blocks)
++    pool_size: int               # total rows per block
++    chunk_rows: int = 0          # rows per H2D/D2D chunk
++    # Per-chunk validity after verify_integrity. True = all rows free → D2D safe.
++    # Length = ceil(staging_rows / chunk_rows). None before verify.
++    chunk_valid: Optional[List[bool]] = None
++
++
++class PreloadManager:
++    def __init__(self):
++        self.h2d_stream = torch.cuda.Stream()
++        self.model_name: Optional[str] = None
++        self.scatter_info: Optional[ScatterStagingInfo] = None
++        self._block_tensors: List[torch.Tensor] = []
++
++    def start_preload(
++        self,
++        model_name: str,
++        cpu_state_dict: dict,
++        bump: "BumpVramAllocator",
++        kv_pool,          # MHATokenToKVPool
++        min_free_slot: int,
++        allocator=None,   # TokenToKVPoolAllocator — for per-chunk slot locking
++        alloc_lock: threading.Lock = None,  # shared lock with allocator
++    ):
++        """Scatter-stage weights into free tails of KV layer blocks."""
++        if self.scatter_info is not None:
++            self.cancel()
++
++        self.model_name = model_name
++        self.scatter_info = None
++
++        # --- Collect blocks and compute layout ---
++        blocks = list(kv_pool.k_buffer) + list(kv_pool.v_buffer)
++        num_blocks = len(blocks)
++        pool_size = blocks[0].shape[0]
++        row_size = blocks[0][0].numel() * blocks[0][0].element_size()
++
++        for i, blk in enumerate(blocks):
++            rs = blk[0].numel() * blk[0].element_size()
++            assert rs == row_size, (
++                f"Block {i} row_size={rs} != block 0 row_size={row_size}. "
++                f"Non-uniform KV head dims not supported yet."
++            )
++
++        staging_start, staging_rows, staged_per_block, staged_bytes = (
++            self._compute_layout(
++                pool_size, row_size, num_blocks, min_free_slot, cpu_state_dict,
++            )
++        )
++        if staged_bytes == 0:
++            logger.info(f"Preload: no staging capacity")
++            return
++
++        self._block_tensors = blocks
++
++        # --- Serialize CPU params → flat byte stream, padded to full block coverage ---
++        cpu_stream = self._serialize_params(cpu_state_dict, staged_bytes,
++                                            num_blocks, staged_per_block)
++
++        # --- H2D scatter with per-chunk locking ---
++        chunk_rows = max(1, H2D_CHUNK_SIZE // row_size)
++        total_written = self._h2d_scatter(
++            blocks, cpu_stream, num_blocks, pool_size, row_size,
++            staging_start, staged_per_block, chunk_rows,
++            allocator, alloc_lock,
++        )
++
++        self.scatter_info = ScatterStagingInfo(
++            staging_start=staging_start,
++            staging_rows=staging_rows,
++            staged_per_block=staged_per_block,
++            num_blocks=num_blocks,
++            total_staged_bytes=total_written,
++            row_size=row_size,
++            pool_size=pool_size,
++            chunk_rows=chunk_rows,
++        )
++
++        logger.info(
++            f"Preload: {model_name}, "
++            f"{total_written / 1024**2:.1f}MB staged across {num_blocks} blocks, "
++            f"rows [{staging_start}, {pool_size}), "
++            f"{staged_per_block / 1024**2:.1f}MB/block, "
++            f"chunk_rows={chunk_rows}"
++        )
++
++    # ------------------------------------------------------------------
++    # Layout computation
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _compute_layout(pool_size, row_size, num_blocks, min_free_slot, cpu_state_dict):
++        """Compute staging layout: how many rows/bytes per block, where to start."""
++        free_rows = pool_size - min_free_slot
++        capacity_per_block = free_rows * row_size
++        total_capacity = num_blocks * capacity_per_block
++
++        total_weight_bytes = sum(
++            t.numel() * t.element_size() for t in cpu_state_dict.values()
++        )
++        staged_bytes = min(total_weight_bytes, total_capacity)
++
++        if staged_bytes == 0:
++            return 0, 0, 0, 0
++
++        staged_per_block = math.ceil(staged_bytes / num_blocks)
++        staging_rows = math.ceil(staged_per_block / row_size)
++        staging_start = pool_size - staging_rows
++
++        return staging_start, staging_rows, staged_per_block, staged_bytes
++
++    # ------------------------------------------------------------------
++    # Param serialization
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _serialize_params(cpu_state_dict, staged_bytes, num_blocks, staged_per_block):
++        """Serialize CPU params into a flat byte stream, padded to full block coverage."""
++        chunks = []
++        remaining = staged_bytes
++        for name, tensor in cpu_state_dict.items():
++            nbytes = tensor.numel() * tensor.element_size()
++            take = min(nbytes, remaining)
++            chunks.append(tensor.contiguous().view(-1).view(torch.uint8)[:take])
++            remaining -= take
++            if remaining <= 0:
++                break
++        stream = torch.cat(chunks)
++
++        # Pad so every block has a full staged_per_block section.
++        padded_len = num_blocks * staged_per_block
++        if len(stream) < padded_len:
++            stream = torch.cat([
++                stream,
++                torch.zeros(padded_len - len(stream), dtype=torch.uint8),
++            ])
++        return stream
++
++    # ------------------------------------------------------------------
++    # H2D scatter loop
++    # ------------------------------------------------------------------
++
++    def _h2d_scatter(
++        self, blocks, cpu_stream, num_blocks, pool_size, row_size,
++        staging_start, staged_per_block, chunk_rows,
++        allocator, alloc_lock,
++    ):
++        """Top-down H2D with per-chunk locking. Returns total bytes written."""
++        chunk_end = pool_size - 1
++        written_per_block = 0
++        total_written = 0
++
++        while chunk_end >= staging_start and written_per_block < staged_per_block:
++            actual_rows = min(chunk_rows, chunk_end - staging_start + 1)
++            chunk_start = chunk_end - actual_rows + 1
++            chunk_bytes = min(actual_rows * row_size, staged_per_block - written_per_block)
++
++            if chunk_bytes <= 0:
++                break
++
++            # --- Lock: remove this chunk's rows from allocator ---
++            locked = None
++            if allocator is not None:
++                _lk = alloc_lock
++                if _lk: _lk.acquire()
++                try:
++                    fp = allocator.free_pages
++                    mask = (fp >= chunk_start) & (fp <= chunk_end)
++                    locked = fp[mask]
++                    if locked.numel() < actual_rows:
++                        # KV invaded this chunk — stop
++                        logger.info(
++                            f"Preload: early exit — only {locked.numel()}/{actual_rows} "
++                            f"rows free in [{chunk_start}, {chunk_end}]"
++                        )
++                        locked = None
++                        break
++                    allocator.free_pages = fp[~mask]
++                finally:
++                    if _lk: _lk.release()
++
++            # --- H2D: reversed byte order (last bytes → highest rows) ---
++            try:
++                with torch.cuda.stream(self.h2d_stream):
++                    actual_total = 0
++                    for bi in range(num_blocks):
++                        # Reverse mapping: high rows get tail bytes, low rows get head bytes
++                        src_off = bi * staged_per_block + (staged_per_block - written_per_block - chunk_bytes)
++                        if src_off + chunk_bytes > len(cpu_stream):
++                            actual = len(cpu_stream) - src_off
++                            if actual <= 0:
++                                break
++                        else:
++                            actual = chunk_bytes
++
++                        dst_off = chunk_start * row_size
++                        flat = blocks[bi].view(-1).view(torch.uint8)
++                        flat[dst_off : dst_off + actual].copy_(
++                            cpu_stream[src_off : src_off + actual],
++                            non_blocking=True,
++                        )
++                        actual_total += actual
++
++                self.h2d_stream.synchronize()
++            finally:
++                # Always unlock, even on error
++                if allocator is not None and locked is not None and locked.numel() > 0:
++                    _lk = alloc_lock
++                    if _lk: _lk.acquire()
++                    try:
++                        allocator.free_pages = torch.cat([locked, allocator.free_pages])
++                    finally:
++                        if _lk: _lk.release()
++
++            total_written += actual_total
++            written_per_block += chunk_bytes
++            chunk_end = chunk_start - 1
++
++        return total_written
++
++    # ------------------------------------------------------------------
++    # Integrity check
++    # ------------------------------------------------------------------
++
++    def verify_integrity(self, allocator):
++        """Check which staging chunks are still valid (all rows free).
++
++        Produces a per-chunk validity list. model_switch D2D iterates chunks:
++        valid chunks → D2D from staging, corrupted chunks → H2D from CPU.
++        """
++        if self.scatter_info is None:
++            return
++
++        si = self.scatter_info
++        free_pages = allocator.free_pages
++        chunk_rows = si.chunk_rows
++        num_chunks = math.ceil(si.staging_rows / chunk_rows)
++
++        if len(free_pages) == 0:
++            si.chunk_valid = [False] * num_chunks
++            logger.info(f"Staging integrity: fully corrupted (no free pages)")
++            return
++
++        # Per-row free mask (GPU-accelerated)
++        staging_range = torch.arange(
++            si.staging_start, si.pool_size, device=free_pages.device
++        )
++        is_free = torch.isin(staging_range, free_pages)
++
++        # Group into chunks
++        chunk_valid = []
++        n_corrupted = 0
++        for ci in range(num_chunks):
++            row_off = ci * chunk_rows
++            row_end = min(row_off + chunk_rows, si.staging_rows)
++            valid = is_free[row_off:row_end].all().item()
++            chunk_valid.append(valid)
++            if not valid:
++                n_corrupted += 1
++
++        si.chunk_valid = chunk_valid
++
++        if n_corrupted == 0:
++            logger.info(
++                f"Staging integrity: all {num_chunks} chunks OK "
++                f"(rows [{si.staging_start}, {si.pool_size}))"
++            )
++        else:
++            corrupted_rows = sum(
++                min(chunk_rows, si.staging_rows - ci * chunk_rows)
++                for ci, v in enumerate(chunk_valid) if not v
++            )
++            corrupted_bytes = corrupted_rows * si.row_size * si.num_blocks
++            logger.info(
++                f"Staging integrity: {n_corrupted}/{num_chunks} chunks corrupted, "
++                f"~{corrupted_bytes / 1024**2:.1f}MB need H2D fallback"
++            )
++
++    # ------------------------------------------------------------------
++    # Properties / helpers
++    # ------------------------------------------------------------------
++
++    def wait_complete(self):
++        self.h2d_stream.synchronize()
++
++    @property
++    def is_valid(self) -> bool:
++        return self.scatter_info is not None and self.scatter_info.total_staged_bytes > 0
++
++    @property
++    def block_tensors(self) -> List[torch.Tensor]:
++        return self._block_tensors
++
++    def cancel(self):
++        self.h2d_stream.synchronize()
++        self.scatter_info = None
++        self._block_tensors = []
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 066d4feda..3bacb48fb 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -145,6 +145,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
+         *,
+         device: torch.device,
+         max_bs: int,
++        bump_manager=None,  # BumpVRAMManager for VRAM-managed allocation
+         max_num_token: int,
+         hidden_size: int,
+         vocab_size: int,
+@@ -160,31 +161,27 @@ class DecodeInputBuffers(ForwardInputBuffers):
+         enable_mamba_track: bool,
+         ne_token_table: Optional[torch.Tensor] = None,
+     ) -> "DecodeInputBuffers":
++        def _alloc(shape, dtype, fill_value=0):
++            """Allocate from bump 'runtime' region if available, else torch."""
++            if bump_manager is not None and "runtime" in bump_manager.regions:
++                t = bump_manager.create_tensor("runtime", shape, dtype)
++                t.fill_(fill_value)
++                return t
++            return torch.full(shape, fill_value, dtype=dtype, device=device)
++
+         with torch.device(device):
+-            input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+-            input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+-            req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+-            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
+-            out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+-            positions = torch.zeros((max_num_token,), dtype=torch.int64)
+-            mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+-            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+-            custom_mask = torch.ones(
+-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+-                dtype=torch.bool,
+-            )
+-            next_token_logits_buffer = torch.zeros(
+-                (max_num_token, vocab_size),
+-                dtype=torch.float,
+-            )
+-            mamba_track_indices = (
+-                torch.zeros((max_bs,), dtype=torch.int64)
+-                if enable_mamba_track
+-                else None
+-            )
+-            mamba_track_mask = (
+-                torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
+-            )
++            input_ids = _alloc((max_num_token,), torch.int64)
++            input_embeds = _alloc((max_num_token, hidden_size), dtype)
++            req_pool_indices = _alloc((max_bs,), torch.int64)
++            seq_lens = _alloc((max_bs,), torch.int32, fill_value=seq_len_fill_value)
++            out_cache_loc = _alloc((max_num_token,), cache_loc_dtype)
++            positions = _alloc((max_num_token,), torch.int64)
++            mrope_positions = _alloc((3, max_num_token), torch.int64)
++            num_token_non_padded = _alloc((1,), torch.int32)
++            custom_mask = _alloc(((max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,), torch.bool, fill_value=1)
++            next_token_logits_buffer = _alloc((max_num_token, vocab_size), torch.float)
++            mamba_track_indices = _alloc((max_bs,), torch.int64) if enable_mamba_track else None
++            mamba_track_mask = _alloc((max_bs,), torch.bool) if enable_mamba_track else None
+ 
+             if pp_size > 1:
+                 pp_proxy_tensors = {
+@@ -616,6 +613,7 @@ class CudaGraphRunner:
+         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
+             device=self.device,
+             max_bs=self.max_bs,
++            bump_manager=getattr(self.model_runner, 'bump_vram_manager', None),
+             max_num_token=self.max_num_token,
+             hidden_size=self.model_runner.model_config.hidden_size,
+             vocab_size=self.model_runner.model_config.vocab_size,
+@@ -822,7 +820,7 @@ class CudaGraphRunner:
+             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+         )
+         graph_fn = (
+-            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
++            partial(memory_saver_adapter.cuda_graph, tag=f"cuda_graph:{self.model_runner.server_args.served_model_name}")
+             if memory_saver_adapter.enabled
+             else self.device_module.graph
+         )
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 297e4bbd7..5bdaf6103 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -464,6 +464,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             enable=self.server_args.enable_memory_saver
+         )
+ 
++        # Bump allocator for model hot-switching
++        self.bump_vram_manager = None
++        if self.server_args.enable_bump_allocator:
++            from sglang.srt.mem_cache.bump_vram_manager import BumpVramAllocator
++            from sglang.srt.utils.common import get_available_gpu_memory
++            avail_gb = get_available_gpu_memory(self.device, self.gpu_id)
++            fraction = getattr(self.server_args, "mem_fraction_bump", 0.95)
++            managed_bytes = int(avail_gb * fraction * 1024**3)
++            logger.info(f"Bump: avail={avail_gb:.1f}GB, fraction={fraction}, managed={managed_bytes/1024**3:.2f}GB")
++            self.bump_vram_manager = BumpVramAllocator(managed_bytes, self.device)
++
+         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+             self.remote_instance_init_transfer_engine()
+ 
+@@ -1060,6 +1071,181 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 ),
+             )
+ 
++    def _migrate_params_to_bump(self, staging_info=None, skip_region_alloc=False):
++        """Migrate model parameters and buffers from CPU to bump buffer.
++
++        If staging_info is provided, uses D2D for staged params and H2D fallback for rest.
++        Otherwise, all params are transferred via H2D.
++        If skip_region_alloc is True, caller is responsible for region management.
++        """
++        bump = self.bump_vram_manager
++
++        # Calculate total size and allocate/reset weights region
++        # Only count persistent buffers (in state_dict). Non-persistent ones
++        # (cos_sin_cache etc.) are computed on GPU, not stored in bump.
++        param_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
++        sd_keys = set(self.model.state_dict().keys())
++        persistent_buf_bytes = sum(
++            b.numel() * b.element_size() for n, b in self.model.named_buffers()
++            if b is not None and b.numel() > 0 and n in sd_keys
++        )
++        total_bytes = param_bytes + persistent_buf_bytes
++        logger.info(f"Bump: params={param_bytes / 1024**2:.1f} MB, "
++                    f"persistent_buffers={persistent_buf_bytes / 1024**2:.1f} MB, "
++                    f"total={total_bytes / 1024**2:.1f} MB")
++
++        if not skip_region_alloc:
++            if "weights" in bump.regions:
++                bump.reset_region("weights", total_bytes)
++            else:
++                bump.allocate_region("weights", total_bytes)
++
++        # Migrate parameters
++        d2d_stream = torch.cuda.Stream() if staging_info else None
++        h2d_stream = torch.cuda.Stream()
++        d2d_count = 0
++        h2d_count = 0
++
++        for name, p in self.model.named_parameters():
++            parts = name.split(".")
++            module = self.model
++            for part in parts[:-1]:
++                module = getattr(module, part)
++            attr_name = parts[-1]
++            managed = bump.create_tensor("weights", p.shape, p.dtype, name=name)
++
++            _staged = staging_info.get(name) if staging_info else None
++            if _staged and _staged.status == "staged":
++                with torch.cuda.stream(d2d_stream):
++                    src = bump.buffer[_staged.staging_offset : _staged.staging_offset + _staged.nbytes]
++                    dst_bytes = managed.nelement() * managed.element_size()
++                    managed.view(-1).view(torch.uint8)[:dst_bytes].copy_(src[:dst_bytes], non_blocking=True)
++                d2d_count += 1
++            else:
++                with torch.cuda.stream(h2d_stream):
++                    managed.copy_(p.data, non_blocking=True)
++                h2d_count += 1
++                if staging_info:
++                    logger.debug(f"  H2D fallback: {name}")
++
++            new_param = torch.nn.Parameter(managed, requires_grad=False)
++            for k, v in p.__dict__.items():
++                if k not in new_param.__dict__:
++                    setattr(new_param, k, v)
++            setattr(module, attr_name, new_param)
++
++        # Migrate persistent buffers to bump (they're in state_dict, covered by staging).
++        # Non-persistent buffers (cos_sin_cache, axis_map, etc.) are computed on GPU
++        # by reserve_rope_cache_for_long_sequences, no transfer needed.
++        persistent_bufs = [(n, b) for n, b in self.model.named_buffers()
++                           if b is not None and b.numel() > 0 and n in sd_keys]
++        for buf_name, buf in persistent_bufs:
++            managed = bump.create_tensor("weights", buf.shape, buf.dtype, name=buf_name)
++            _staged = staging_info.get(buf_name) if staging_info else None
++            if _staged and _staged.status == "staged":
++                with torch.cuda.stream(d2d_stream):
++                    src = bump.buffer[_staged.staging_offset : _staged.staging_offset + _staged.nbytes]
++                    dst_bytes = managed.nelement() * managed.element_size()
++                    managed.view(-1).view(torch.uint8)[:dst_bytes].copy_(src[:dst_bytes], non_blocking=True)
++                d2d_count += 1
++            else:
++                with torch.cuda.stream(h2d_stream):
++                    managed.copy_(buf.data, non_blocking=True)
++                h2d_count += 1
++                if staging_info:
++                    logger.debug(f"  H2D fallback: {buf_name}")
++            parts = buf_name.split(".")
++            module = self.model
++            for part in parts[:-1]:
++                module = getattr(module, part)
++            module._buffers[parts[-1]] = managed
++        if persistent_bufs:
++            logger.info(f"Bump: {len(persistent_bufs)} persistent buffers migrated")
++
++        # Synchronize
++        if d2d_stream:
++            d2d_stream.synchronize()
++        h2d_stream.synchronize()
++        logger.info(f"Bump: weights migrated (D2D: {d2d_count}, H2D: {h2d_count}), "
++                    f"used {bump.regions['weights'].used_bytes / 1024**2:.1f} MB")
++
++    def _init_runtime_region(self):
++        """Allocate bump 'runtime' region for flashinfer workspace + decode input buffers."""
++        bump = self.bump_vram_manager
++        if bump is None:
++            return
++        from sglang.srt.environ import envs
++        ws_size = (2048 * 1024 * 1024 if self.server_args.enable_deterministic_inference
++                   else envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get())
++
++        # Estimate DecodeInputBuffers size (allocated into runtime region during graph capture)
++        buf_size = 0
++        if not self.server_args.disable_cuda_graph:
++            max_bs = max(self.server_args.cuda_graph_bs)
++            num_tokens_per_bs = 1
++            max_num_token = max_bs * num_tokens_per_bs
++            hidden_size = self.model_config.hidden_size
++            vocab_size = self.model_config.vocab_size
++            dtype_size = 2 if self.model_config.dtype in (torch.float16, torch.bfloat16) else 4
++            buf_size = (
++                max_num_token * 8                          # input_ids (int64)
++                + max_num_token * hidden_size * dtype_size  # input_embeds
++                + max_bs * 8                               # req_pool_indices (int64)
++                + max_bs * 4                               # seq_lens (int32)
++                + max_num_token * 8                        # out_cache_loc (int64)
++                + max_num_token * 8                        # positions (int64)
++                + 3 * max_num_token * 8                    # mrope_positions (int64)
++                + 4                                        # num_token_non_padded (int32)
++                + max_num_token * vocab_size * 4            # next_token_logits_buffer (float32)
++            )
++            buf_size = int(buf_size * 1.1)  # 10% headroom for alignment + misc
++
++        total_size = ws_size + buf_size
++        if "runtime" in bump.regions:
++            bump.reset_region("runtime", total_size)
++        else:
++            bump.allocate_region("runtime", total_size)
++        logger.info(f"Bump: runtime reserve={total_size/1024**2:.0f}MB "
++                    f"(workspace={ws_size/1024**2:.0f}MB, buffers={buf_size/1024**2:.0f}MB)")
++
++
++    def _load_model_bump(self, model_name=None, staging_info=None, skip_region_alloc=False):
++        """Load model into bump buffer. Gets CPU model from global CpuModelCache.
++
++        First call (startup): cache.load() does disk → CPU → pin, then H2D.
++        Subsequent calls (switch): restores pinned params from cache, then D2D/H2D.
++        """
++        from sglang.srt.mem_cache.cpu_model_cache import get_cpu_model_cache
++
++        bump = self.bump_vram_manager
++        model_name = model_name or self.server_args.served_model_name
++        bump._current_model = model_name
++
++        cache = get_cpu_model_cache()
++        entry = cache.get_entry(model_name)
++
++        # First load: trigger disk → CPU → pin
++        if entry.cpu_model is None:
++            cache.load(model_name)
++
++        # Wait for loading to finish
++        cpu_model, _ = cache.get_cpu_model(model_name)
++
++        # Restore pinned CPU params (previous _migrate replaced them with GPU views)
++        for name, p in cpu_model.named_parameters():
++            if name in entry.cpu_state_dict:
++                p.data = entry.cpu_state_dict[name]
++
++        self.model = cpu_model
++        self.model.eval()
++
++        # Migrate parameters to bump (D2D for staged, H2D for the rest)
++        self._migrate_params_to_bump(staging_info=staging_info, skip_region_alloc=skip_region_alloc)
++
++        # Ensure non-persistent buffers (cos_sin_cache) are on GPU
++        from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
++        reserve_rope_cache_for_long_sequences(self.model, self.server_args, self.model_config)
++
+     def load_model(self):
+         tic_total = time.perf_counter()
+         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+@@ -1137,25 +1323,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         # Remove monkey_patch when linear.py quant remove dependencies with vllm
+         monkey_patch_vllm_parallel_state()
+ 
+-        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
+-            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
+-        )
+-        with self.memory_saver_adapter.region(
+-            GPU_MEMORY_TYPE_WEIGHTS,
+-            enable_cpu_backup=enable_cpu_backup,
+-        ):
+-            self.loader = get_model_loader(
+-                load_config=self.load_config,
+-                model_config=self.model_config,
+-            )
+-            self.model = self.loader.load_model(
+-                model_config=self.model_config,
+-                device_config=DeviceConfig(self.device, self.gpu_id),
++        # Bump allocator path: meta-device init + managed buffer
++        if self.bump_vram_manager is not None:
++            self._init_runtime_region()  # runtime at offset 0 (fixed position)
++            self._load_model_bump()
++        else:
++            enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
++                self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
+             )
+-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
+-                self.remote_instance_transfer_engine_weight_info = (
+-                    self.loader.remote_instance_transfer_engine_weight_info
++            with self.memory_saver_adapter.region(
++                GPU_MEMORY_TYPE_WEIGHTS,
++                enable_cpu_backup=enable_cpu_backup,
++            ):
++                self.loader = get_model_loader(
++                    load_config=self.load_config,
++                    model_config=self.model_config,
++                )
++                self.model = self.loader.load_model(
++                    model_config=self.model_config,
++                    device_config=DeviceConfig(self.device, self.gpu_id),
+                 )
++                if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
++                    self.remote_instance_transfer_engine_weight_info = (
++                        self.loader.remote_instance_transfer_engine_weight_info
++                    )
+         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+         if _is_npu:
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index 291d9515d..be1028ff7 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -140,6 +140,39 @@ class ModelRunnerKVCacheMixin:
+         return cell_size
+ 
+     def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
++        # Bump allocator: compute from managed buffer remaining space
++        if getattr(self, "bump_vram_manager", None) is not None:
++            bump = self.bump_vram_manager
++            cell_size = self.get_cell_size_per_token(self.num_effective_layers)
++            available_bytes = bump.get_available_bytes()
++            # Reserve runtime region (workspace + decode input buffers)
++            from sglang.srt.environ import envs
++            ws_size = (2048 * 1024 * 1024 if self.server_args.enable_deterministic_inference
++                       else envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get())
++            buf_size = 0
++            if not self.server_args.disable_cuda_graph:
++                max_bs = max(self.server_args.cuda_graph_bs)
++                max_num_token = max_bs
++                hidden_size = self.model_config.hidden_size
++                vocab_size = self.model_config.vocab_size
++                dtype_size = 2 if self.model_config.dtype in (torch.float16, torch.bfloat16) else 4
++                buf_size = (
++                    max_num_token * 8
++                    + max_num_token * hidden_size * dtype_size
++                    + max_bs * 8 + max_bs * 4
++                    + max_num_token * 8 + max_num_token * 8
++                    + 3 * max_num_token * 8 + 4
++                    + max_num_token * vocab_size * 4
++                )
++                buf_size = int(buf_size * 1.1)
++            available_bytes -= (ws_size + buf_size)
++            max_tokens = available_bytes // cell_size
++            logger.info(
++                f"Bump: KV cache available={available_bytes/1024**2:.1f}MB, "
++                f"cell_size={cell_size}, max_tokens={max_tokens}"
++            )
++            return max_tokens
++
+         post_model_load_memory = get_available_gpu_memory(
+             self.device,
+             self.gpu_id,
+@@ -705,6 +738,7 @@ class ModelRunnerKVCacheMixin:
+                         enable_kv_cache_copy=(
+                             self.server_args.speculative_algorithm is not None
+                         ),
++                        bump_vram_manager=getattr(self, "bump_vram_manager", None),
+                     )
+ 
+         # Initialize token_to_kv_pool_allocator
+@@ -773,6 +807,7 @@ class ModelRunnerKVCacheMixin:
+                             device=self.device,
+                             kvcache=self.token_to_kv_pool,
+                             need_sort=need_sort,
++                            lifo_mode=getattr(self.server_args, "enable_bump_allocator", False),
+                         )
+                     else:
+                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 4229f4093..9e18bde1b 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -649,6 +649,8 @@ class ServerArgs:
+     num_continuous_decode_steps: int = 1
+     delete_ckpt_after_loading: bool = False
+     enable_memory_saver: bool = False
++    enable_bump_allocator: bool = False
++    mem_fraction_bump: float = 0.95  # fraction of available GPU memory for bump allocator
+     enable_weights_cpu_backup: bool = False
+     enable_draft_weights_cpu_backup: bool = False
+     allow_auto_truncate: bool = False
+@@ -5551,6 +5553,17 @@ class ServerArgs:
+             action="store_true",
+             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+         )
++        parser.add_argument(
++            "--enable-bump-allocator",
++            action="store_true",
++            help="Use bump allocator for self-managed VRAM (model hot-switching)",
++        )
++        parser.add_argument(
++            "--mem-fraction-bump",
++            type=float,
++            default=0.95,
++            help="Fraction of available GPU memory for bump allocator (default 0.95)",
++        )
+         parser.add_argument(
+             "--enable-weights-cpu-backup",
+             action="store_true",
+diff --git a/python/sglang/srt/managers/model_switch.py b/python/sglang/srt/managers/model_switch.py
+new file mode 100644
+index 000000000..b72dc9665
+--- /dev/null
++++ b/python/sglang/srt/managers/model_switch.py
+@@ -0,0 +1,505 @@
++"""
++Multi-model manager: model hot-switching with D2D staging + bump allocator.
++"""
++
++from __future__ import annotations
++
++import logging
++import time
++from typing import TYPE_CHECKING
++
++import torch
++
++from sglang.srt.configs.model_config import ModelConfig
++
++if TYPE_CHECKING:
++    from sglang.srt.managers.scheduler import Scheduler
++
++logger = logging.getLogger(__name__)
++
++# Per-model CUDA graph + attn_backend cache
++_graph_cache = {}
++
++
++def _get_graph_pool():
++    from sglang.srt.model_executor.cuda_graph_runner import get_global_graph_memory_pool
++
++    return get_global_graph_memory_pool()
++
++
++def _set_graph_pool(pool):
++    from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
++
++    set_global_graph_memory_pool(pool)
++
++
++_kv_pool_cache = {}
++_model_cache = {}
++_runtime_cache = {}  # model_name -> runtime region capacity
++
++
++def _save_graph_cache(runner, model_name, memory_saver_adapter=None):
++    """Cache CUDA graph runner + attn_backend, and pause VMM graph pool."""
++    if runner.graph_runner is None:
++        return
++    try:
++        from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
++
++        # Save CUDA buffers (cos_sin_cache etc.) for address-stable restore
++        saved_buffers = {}
++        if runner.model is not None:
++            for n, b in runner.model.named_buffers():
++                if b is not None and b.device.type == "cuda" and b.numel() > 0:
++                    saved_buffers[n] = b
++        vmm_tag = f"cuda_graph:{model_name}"
++        _graph_cache[model_name] = {
++            "vmm_graph_tag": vmm_tag,
++            "graph_runner": runner.graph_runner,
++            "attn_backend": runner.attn_backend,
++            "input_buffer_pool": dict(_forward_input_buffer_pool),
++            "graph_pool_handle": _get_graph_pool(),
++            "model_buffers": saved_buffers,
++        }
++        # Pause VMM physical pages for this model's graph pool
++        if memory_saver_adapter is not None and memory_saver_adapter.enabled:
++            memory_saver_adapter.pause(vmm_tag)
++            logger.debug(f"  VMM: paused graph pool tag={vmm_tag}")
++        logger.info(f"  Graph cache saved for {model_name}")
++    except Exception as e:
++        logger.warning(f"  Graph cache save failed: {e}")
++
++
++def _get_module_by_path(root, dotted_name):
++    """Walk dotted path, return (parent_module, last_attr_name)."""
++    parts = dotted_name.split(".")
++    module = root
++    for part in parts[:-1]:
++        module = getattr(module, part)
++    return module, parts[-1]
++
++
++def _restore_graph_cache(runner, model_name, memory_saver_adapter=None):
++    """Restore cached CUDA graph runner + attn_backend, and resume VMM graph pool."""
++    if model_name not in _graph_cache:
++        return False
++    try:
++        cached = _graph_cache[model_name]
++        # Resume VMM physical pages before restoring graph
++        if memory_saver_adapter is not None and memory_saver_adapter.enabled:
++            resume_tag = cached.get("vmm_graph_tag", f"cuda_graph:{model_name}")
++            memory_saver_adapter.resume(resume_tag)
++            logger.debug(f"  VMM: resumed graph pool tag={resume_tag}")
++        runner.graph_runner = cached["graph_runner"]
++        # Restore the graph memory pool (each model must use its own pool)
++        saved_pool = cached.get("graph_pool_handle")
++        if saved_pool is not None:
++            _set_graph_pool(saved_pool)
++        runner.attn_backend = cached["attn_backend"]
++
++        # Update stale internal references in restored attn_backend
++        ab = runner.attn_backend
++        new_req_to_token = runner.req_to_token_pool.req_to_token
++        new_allocator = runner.token_to_kv_pool_allocator
++        # indices_updater_decode holds req_to_token and allocator refs from old init
++        if hasattr(ab, "indices_updater_decode"):
++            ab.indices_updater_decode.req_to_token = new_req_to_token
++            ab.indices_updater_decode.token_to_kv_pool_allocator = new_allocator
++        # indices_updater_prefill too
++        if hasattr(ab, "indices_updater_prefill"):
++            if hasattr(ab.indices_updater_prefill, "req_to_token"):
++                ab.indices_updater_prefill.req_to_token = new_req_to_token
++            if hasattr(ab.indices_updater_prefill, "token_to_kv_pool_allocator"):
++                ab.indices_updater_prefill.token_to_kv_pool_allocator = new_allocator
++
++        from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
++
++        _forward_input_buffer_pool.clear()
++        _forward_input_buffer_pool.update(cached["input_buffer_pool"])
++
++        # Restore model buffers - skip copy if model cache hit (same addresses)
++        _is_model_cached = model_name in _model_cache
++        saved_buffers = cached.get("model_buffers", {})
++        if saved_buffers and runner.model is not None:
++            if _is_model_cached:
++                # Model cache hit: copy current buffer data to graph-known addresses.
++                # D2D + recompute may have updated data; copy it to saved tensor
++                # (whose address was captured by CUDA graph) then replace ref.
++                for buf_name, saved_buf in saved_buffers.items():
++                    try:
++                        module, attr = _get_module_by_path(runner.model, buf_name)
++                        current_buf = module._buffers.get(attr)
++                        if current_buf is not None and current_buf.shape == saved_buf.shape:
++                            saved_buf.copy_(current_buf)
++                        module._buffers[attr] = saved_buf
++                    except (AttributeError, KeyError):
++                        pass
++            else:
++                for buf_name, saved_buf in saved_buffers.items():
++                    try:
++                        module, attr = _get_module_by_path(runner.model, buf_name)
++                        new_buf = module._buffers.get(attr)
++                        if (
++                            new_buf is not None
++                            and new_buf.shape == saved_buf.shape
++                            and new_buf.dtype == saved_buf.dtype
++                        ):
++                            saved_buf.copy_(new_buf)
++                        module._buffers[attr] = saved_buf
++                    except (AttributeError, KeyError):
++                        pass
++
++        # Kept for reuse on next switch
++        # Diagnostic: log key tensor addresses after restore
++        logger.info(f"  Graph cache restored for {model_name}")
++        return True
++    except Exception as e:
++        logger.warning(f"  Graph cache restore failed: {e}")
++        if model_name in _graph_cache:
++            del _graph_cache[model_name]
++        return False
++
++
++def _propagate_refs(scheduler, runner, new_config, target_model_path):
++    """Sync runner state to scheduler and worker after model switch."""
++    worker = scheduler.tp_worker
++    worker.model_config = new_config
++    worker.max_total_num_tokens = runner.max_total_num_tokens
++    worker.max_running_requests = runner.max_running_requests
++    worker.max_req_len = min(new_config.context_len - 1, runner.max_token_pool_size - 1)
++    worker.max_req_input_len = worker.max_req_len - 5
++    scheduler.req_to_token_pool = runner.req_to_token_pool
++    scheduler.token_to_kv_pool_allocator = runner.token_to_kv_pool_allocator
++    scheduler.max_total_num_tokens = runner.max_total_num_tokens
++    scheduler.max_running_requests = runner.max_running_requests
++    scheduler.max_req_len = worker.max_req_len
++    scheduler.max_req_input_len = worker.max_req_input_len
++    if scheduler.tree_cache is not None:
++        scheduler.tree_cache.req_to_token_pool = runner.req_to_token_pool
++        scheduler.tree_cache.token_to_kv_pool_allocator = runner.token_to_kv_pool_allocator
++    scheduler.model_config = new_config
++    scheduler.server_args.model_path = target_model_path
++    scheduler.offload_tags.clear()
++
++
++def _serialize_cpu_state_dict(cpu_sd, padded_len):
++    """Serialize CPU state_dict into a padded contiguous byte tensor."""
++    from sglang.srt.mem_cache.weight_staging import PreloadManager
++    return PreloadManager._serialize_params(cpu_sd, padded_len, 1, padded_len)
++
++
++def _scatter_gather_weights(si, blocks, bump, weights_start, cpu_sd, total_weight_target):
++    """D2D gather valid chunks from staging, H2D corrupted chunks from CPU.
++
++    Args:
++        si: ScatterStagingInfo from preload
++        blocks: list of KV layer block tensors
++        bump: BumpVramAllocator
++        weights_start: byte offset of weights region in bump.buffer
++        cpu_sd: CPU state_dict for H2D fallback (may be None)
++        total_weight_target: total weight bytes needed (for unstaged tail)
++    Returns:
++        (d2d_bytes, h2d_bytes) tuple
++    """
++    d2d_stream = torch.cuda.Stream()
++    h2d_stream = torch.cuda.Stream()
++
++    chunk_valid = si.chunk_valid or []
++    chunk_rows = si.chunk_rows
++    num_chunks = len(chunk_valid)
++    d2d_bytes = 0
++    h2d_bytes = 0
++
++    # Prepare padded CPU stream for H2D fallback (only if corrupted chunks exist)
++    has_corrupted = any(not v for v in chunk_valid)
++    cpu_stream = None
++    if has_corrupted and cpu_sd is not None:
++        padded_len = si.num_blocks * si.staged_per_block
++        cpu_stream = _serialize_cpu_state_dict(cpu_sd, padded_len)
++
++    # Per-chunk: valid → D2D from staging, corrupted → H2D from CPU
++    # Byte layout: lowest staging rows = first bytes (reversed during H2D)
++    for ci in range(num_chunks):
++        row_start = si.staging_start + ci * chunk_rows
++        row_end = min(row_start + chunk_rows, si.pool_size)
++        byte_off = ci * chunk_rows * si.row_size
++        nbytes = min((row_end - row_start) * si.row_size,
++                     si.staged_per_block - byte_off)
++        if nbytes <= 0:
++            break
++
++        src_off = row_start * si.row_size
++
++        if chunk_valid[ci]:
++            with torch.cuda.stream(d2d_stream):
++                for bi in range(si.num_blocks):
++                    src = blocks[bi].view(-1).view(torch.uint8)[src_off : src_off + nbytes]
++                    dst = weights_start + bi * si.staged_per_block + byte_off
++                    bump.buffer[dst : dst + nbytes].copy_(src, non_blocking=True)
++            d2d_bytes += nbytes * si.num_blocks
++        elif cpu_stream is not None:
++            with torch.cuda.stream(h2d_stream):
++                for bi in range(si.num_blocks):
++                    cpu_off = bi * si.staged_per_block + byte_off
++                    dst = weights_start + cpu_off
++                    bump.buffer[dst : dst + nbytes].copy_(
++                        cpu_stream[cpu_off : cpu_off + nbytes], non_blocking=True
++                    )
++            h2d_bytes += nbytes * si.num_blocks
++
++    # H2D for unstaged params (didn't fit in staging)
++    if cpu_sd is not None and si.total_staged_bytes < total_weight_target:
++        with torch.cuda.stream(h2d_stream):
++            _h2d_remaining_params(
++                cpu_sd, bump,
++                weights_start + si.total_staged_bytes,
++                si.total_staged_bytes, total_weight_target,
++            )
++        h2d_bytes += total_weight_target - si.total_staged_bytes
++
++    d2d_stream.synchronize()
++    h2d_stream.synchronize()
++    return d2d_bytes, h2d_bytes
++
++
++def _h2d_remaining_params(cpu_sd: dict, bump, dst_offset: int, skip_bytes: int, total_bytes: int):
++    """H2D params that weren't staged (the tail of the byte stream)."""
++    pos = 0
++    for name, tensor in cpu_sd.items():
++        nbytes = tensor.numel() * tensor.element_size()
++        end = pos + nbytes
++        if end <= skip_bytes:
++            pos = end
++            continue
++        # This param has some bytes beyond skip_bytes
++        start_in_param = max(0, skip_bytes - pos)
++        take = min(nbytes - start_in_param, total_bytes - max(pos, skip_bytes))
++        if take <= 0:
++            break
++        cpu_bytes = tensor.contiguous().view(-1).view(torch.uint8)[start_in_param : start_in_param + take]
++        write_off = dst_offset + max(pos, skip_bytes) - skip_bytes
++        bump.buffer[write_off : write_off + take].copy_(cpu_bytes, non_blocking=True)
++        pos = end
++        if pos >= total_bytes:
++            break
++
++
++def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
++    """Switch model without releasing bump regions. D2D staging + in-place overwrite.
++
++    5 phases:
++      1. Save & teardown — snapshot old model state, release runtime/graph/attn
++      2. Load weights — verify staging integrity, D2D/H2D weights
++      3. KV cache — restore or rebuild KV pool
++      4. Runtime & CUDA graph — allocate runtime, restore or recapture graphs
++      5. Finalize — propagate refs to scheduler/worker
++    """
++    runner = scheduler.tp_worker.model_runner
++    bump = runner.bump_vram_manager
++    timings = {}
++    t_total = time.perf_counter()
++    current_model_name = scheduler.active_model_name
++    logger.info(f"Bump switch: {scheduler.server_args.model_path} -> {target_model_path}")
++
++    # === Phase 1: Save & teardown ===
++    t0 = time.perf_counter()
++
++    # 1a. Save caches for fast switch-back
++    if current_model_name not in _graph_cache:
++        _msa = scheduler.memory_saver_adapter if scheduler.memory_saver_adapter.enabled else None
++        _save_graph_cache(runner, current_model_name, memory_saver_adapter=_msa)
++    _kv_pool_cache[current_model_name] = {
++        "req_to_token_pool": runner.req_to_token_pool,
++        "token_to_kv_pool": runner.token_to_kv_pool,
++        "token_to_kv_pool_allocator": runner.token_to_kv_pool_allocator,
++        "max_total_num_tokens": runner.max_total_num_tokens,
++        "max_running_requests": runner.max_running_requests,
++        "weight_bytes": bump.regions["weights"].capacity,
++        "kv_region_capacity": bump.regions["kv_cache"].capacity,
++    }
++    _model_cache[current_model_name] = runner.model
++    _runtime_cache[current_model_name] = bump.regions["runtime"].capacity
++
++    # 1b. Teardown old model state
++    runner.graph_runner = None
++    bump.release_region("runtime")
++    runner.attn_backend = None
++    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
++    _ROPE_DICT.clear()
++    import sglang.srt.layers.attention.flashinfer_backend as _fi_mod
++    _fi_mod.global_workspace_buffer = None
++
++    timings["save_teardown"] = time.perf_counter() - t0
++    logger.debug(f"  save_teardown: {timings['save_teardown']*1000:.1f}ms")
++
++    # === Phase 2: Load weights ===
++    t0 = time.perf_counter()
++
++    # 2a. Verify staging integrity (before clearing allocator)
++    _pt = scheduler._preload_thread
++    if _pt is not None and _pt.is_alive():
++        _pt.join()
++    _preload_mgr = scheduler._preload_manager
++    _has_staging = (
++        _preload_mgr is not None
++        and _preload_mgr.model_name == target_model_name
++        and _preload_mgr.is_valid
++    )
++    if _has_staging:
++        _preload_mgr.wait_complete()
++        _preload_mgr.verify_integrity(scheduler.token_to_kv_pool_allocator)
++        _si = _preload_mgr.scatter_info
++        _n_corrupted = sum(1 for v in (_si.chunk_valid or []) if not v)
++        logger.debug(
++            f"  Staging: {_si.total_staged_bytes / 1024**2:.1f}MB across {_si.num_blocks} blocks, "
++            f"corrupted_chunks={_n_corrupted}/{len(_si.chunk_valid or [])}"
++        )
++
++    # 2b. Update config for target model
++    runner.server_args.model_path = target_model_path
++    new_config = ModelConfig.from_server_args(runner.server_args, model_path=target_model_path)
++    runner.model_config = new_config
++    runner.start_layer = 0
++    runner.end_layer = new_config.num_hidden_layers
++    runner.num_effective_layers = new_config.num_hidden_layers
++    runner.dtype = new_config.dtype
++    runner.kv_cache_dtype = new_config.dtype
++    bump._current_model = target_model_name
++
++    # 2c. Get CPU model data
++    _cpu_model = None
++    _cpu_sd = None
++    if scheduler._cpu_model_cache is not None:
++        _cpu_model, _ = scheduler._cpu_model_cache.get_cpu_model(target_model_name)
++        _reg_info = scheduler._cpu_model_cache.get_entry(target_model_name)
++        if _reg_info:
++            _cpu_sd = _reg_info.cpu_state_dict
++
++    # 2d. Load weights: D2D from staging or full H2D
++    _cached_model = _model_cache.get(target_model_name)
++    if _cached_model is not None and _has_staging:
++        # D2D scatter-gather from KV block tails to weights region
++        layer_map = bump.get_layer_map(target_model_name)
++        weights_start = bump.regions["weights"].start
++        if layer_map:
++            needed_bytes = max(s.offset + s.nbytes for s in layer_map) - weights_start
++        else:
++            needed_bytes = 0
++        current_cap = bump.regions["weights"].capacity
++        if needed_bytes > current_cap:
++            bump.release_region("kv_cache")
++            bump.reset_region("weights", needed_bytes)
++            logger.info(f"  Weights region resized: {current_cap/1024**2:.1f}MB -> {needed_bytes/1024**2:.1f}MB")
++            weights_start = bump.regions["weights"].start
++
++        h2d_src = _cpu_sd
++        if h2d_src is None and _cpu_model is not None:
++            h2d_src = {k: v.detach().cpu().clone() for k, v in _cpu_model.state_dict().items()}
++
++        total_target = needed_bytes or current_cap
++        d2d_bytes, h2d_bytes = _scatter_gather_weights(
++            si=_preload_mgr.scatter_info,
++            blocks=_preload_mgr.block_tensors,
++            bump=bump,
++            weights_start=weights_start,
++            cpu_sd=h2d_src,
++            total_weight_target=total_target,
++        )
++
++        runner.model = _cached_model
++        runner.model.eval()
++        bump.regions["weights"]._sub_offset = bump.regions["weights"].capacity
++        bump._current_model = target_model_name
++        logger.info(f"  Scatter D2D: {d2d_bytes / 1024**2:.1f}MB, H2D fallback: {h2d_bytes / 1024**2:.1f}MB")
++    else:
++        # Full load via _load_model_bump from CPU or disk
++        if _cpu_model is not None:
++            param_bytes = sum(p.numel() * p.element_size() for p in _cpu_model.parameters())
++            buf_bytes = sum(b.numel() * b.element_size() for b in _cpu_model.buffers()
++                           if b is not None and b.numel() > 0)
++            total_weight_bytes = param_bytes + buf_bytes
++        elif _cpu_sd is not None:
++            total_weight_bytes = sum(v.numel() * v.element_size() for v in _cpu_sd.values())
++        else:
++            total_weight_bytes = 0
++        bump.release_region("kv_cache")
++        if "weights" in bump.regions:
++            bump.reset_region("weights", total_weight_bytes)
++        else:
++            bump.allocate_region("weights", total_weight_bytes)
++        runner._load_model_bump(model_name=target_model_name, staging_info=None, skip_region_alloc=True)
++
++    timings["load"] = time.perf_counter() - t0
++    logger.info(f'  load: {timings["load"]:.3f}s')
++
++    # === Phase 3: KV cache rebuild ===
++    t0 = time.perf_counter()
++
++    _kv_cached = _kv_pool_cache.get(target_model_name)
++    if _kv_cached:
++        if "kv_cache" in bump.regions:
++            bump.release_region("kv_cache")
++        from sglang.srt.model_executor.model_runner import _estimate_runtime_bytes
++        _rt_ws, _rt_buf = _estimate_runtime_bytes(runner.server_args, runner.model_config)
++        _kv_cap = min(_kv_cached["kv_region_capacity"], bump.get_available_bytes() - _rt_ws - _rt_buf)
++        _kv_cap = max(_kv_cap, 0)
++        bump.allocate_region("kv_cache", _kv_cap)
++        runner.req_to_token_pool = _kv_cached["req_to_token_pool"]
++        runner.token_to_kv_pool = _kv_cached["token_to_kv_pool"]
++        runner.token_to_kv_pool_allocator = _kv_cached["token_to_kv_pool_allocator"]
++        runner.max_total_num_tokens = _kv_cached["max_total_num_tokens"]
++        runner.max_running_requests = _kv_cached["max_running_requests"]
++        runner.token_to_kv_pool_allocator.clear()
++        scheduler.flush_cache()
++        logger.debug(f"  KV pool cache hit: {target_model_name}")
++    else:
++        if "kv_cache" in bump.regions:
++            bump.release_region("kv_cache")
++        scheduler.flush_cache()
++        for attr in ["req_to_token_pool", "token_to_kv_pool", "token_to_kv_pool_allocator"]:
++            for obj in [runner, scheduler, scheduler.tp_worker]:
++                setattr(obj, attr, None)
++        runner.init_memory_pool(0)
++
++    timings["kv_cache"] = time.perf_counter() - t0
++    logger.debug(f"  kv_cache: {timings['kv_cache']*1000:.1f}ms")
++
++    # === Phase 4: Runtime & CUDA graph ===
++    t0 = time.perf_counter()
++
++    _rt_cached = _runtime_cache.get(target_model_name)
++    if _rt_cached and "runtime" not in bump.regions:
++        bump.allocate_region("runtime", _rt_cached)
++        from sglang.srt.model_executor.model_runner import _estimate_runtime_bytes
++        _ws_size, _ = _estimate_runtime_bytes(runner.server_args, runner.model_config)
++        from sglang.srt.environ import envs
++        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(_ws_size)
++    else:
++        runner._init_runtime_region()
++    runner.init_attention_backend()
++
++    from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
++    _forward_input_buffer_pool.clear()
++
++    if not scheduler.server_args.disable_cuda_graph:
++        _msa = scheduler.memory_saver_adapter if scheduler.memory_saver_adapter.enabled else None
++        if not _restore_graph_cache(runner, target_model_name, memory_saver_adapter=_msa):
++            _set_graph_pool(None)
++            runner.init_device_graphs()
++
++    timings["runtime_graph"] = time.perf_counter() - t0
++    logger.debug(f"  runtime_graph: {timings['runtime_graph']*1000:.1f}ms")
++
++    # === Phase 5: Finalize ===
++    _propagate_refs(scheduler, runner, new_config, target_model_path)
++
++    timings["total"] = time.perf_counter() - t_total
++    logger.info(
++        f"  SWITCH {current_model_name} -> {target_model_name}: "
++        f"save={timings.get('save_teardown',0)*1000:.1f}ms "
++        f"load={timings.get('load',0)*1000:.1f}ms "
++        f"kv={timings.get('kv_cache',0)*1000:.1f}ms "
++        f"rt+graph={timings.get('runtime_graph',0)*1000:.1f}ms "
++        f"TOTAL={timings['total']*1000:.1f}ms"
++    )
++
++    return timings

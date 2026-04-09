@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
+    RegisterModelNotification,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -100,6 +101,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
 
     def init_tokenizer(self, server_args: ServerArgs):
+        self.model_tokenizers = {}  # model_name -> tokenizer
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -109,6 +111,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
+            model_name = server_args.served_model_name or server_args.model_path
+            self.model_tokenizers[model_name] = self.tokenizer
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
@@ -139,10 +143,28 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+            if isinstance(recv_obj, RegisterModelNotification):
+                self._preload_tokenizer(recv_obj.model_name, recv_obj.model_path)
+                self.soft_watchdog.feed()
+                continue
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
             self.soft_watchdog.feed()
+
+    def _preload_tokenizer(self, model_name: str, model_path: str):
+        """Pre-load tokenizer in background thread (non-blocking)."""
+        if model_name in self.model_tokenizers:
+            return
+        import threading
+        def _load():
+            try:
+                tok = get_tokenizer(model_path)
+                self.model_tokenizers[model_name] = tok
+                logger.info(f"Detokenizer pre-cached tokenizer: {model_name}")
+            except Exception as e:
+                logger.warning(f"Failed to pre-cache tokenizer {model_name}: {e}")
+        threading.Thread(target=_load, daemon=True).start()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -319,6 +341,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_strs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        # Multi-model: select tokenizer by model_name
+        _name = recv_obj.model_name
+        if _name and _name in self.model_tokenizers:
+            self.tokenizer = self.model_tokenizers[_name]
+
         # If handling idle batch, set output_strs to [].
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)
