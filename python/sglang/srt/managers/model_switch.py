@@ -468,6 +468,10 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(_ws_size)
         else:
             runner._init_runtime_region()
+        logger.info(f"  KV pool init: num_heads={runner.model_config.num_attention_heads}, "
+                    f"num_kv_heads={runner.model_config.get_num_kv_heads(1)}, "
+                    f"head_dim={runner.model_config.head_dim}, "
+                    f"num_layers={runner.model_config.num_hidden_layers}")
         runner.init_memory_pool(0)
 
     timings["kv_cache"] = time.perf_counter() - t0
@@ -476,6 +480,8 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     # === Phase 4: Attention backend + CUDA graph ===
     t0 = time.perf_counter()
     runner.init_attention_backend()
+    # Update piecewise graph runner's cached attention/moe layers for new model
+    runner.init_piecewise_cuda_graphs()
 
     from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
     _forward_input_buffer_pool.clear()
@@ -491,6 +497,13 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
 
     # === Phase 5: Finalize ===
     _propagate_refs(scheduler, runner, new_config, target_model_path)
+
+    # DEBUG: verify model attention head config after switch
+    for i, layer in enumerate(runner.model.modules()):
+        cls_name = type(layer).__name__
+        if cls_name == "RadixAttention":
+            logger.info(f"  DEBUG RadixAttention layer {i}: tp_q_head_num={layer.tp_q_head_num}, head_dim={layer.head_dim}")
+            break
 
     timings["total"] = time.perf_counter() - t_total
     logger.info(
