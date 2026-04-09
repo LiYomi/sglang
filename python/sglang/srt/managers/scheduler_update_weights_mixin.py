@@ -224,6 +224,9 @@ class SchedulerUpdateWeightsMixin:
 
     def _execute_pending_switch(self):
         if self._pending_switch is not None and self.running_batch.is_empty():
+            # Also ensure no batch is currently being processed (last_batch cleared)
+            if self.last_batch is not None and not self.last_batch.is_empty():
+                return
             name, path = self._pending_switch
             self._execute_model_switch(name, path)
 
