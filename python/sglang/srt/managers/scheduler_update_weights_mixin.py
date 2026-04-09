@@ -223,7 +223,7 @@ class SchedulerUpdateWeightsMixin:
         # Preload will be triggered by _check_preload() in the scheduler loop
 
     def _execute_pending_switch(self):
-        if self._pending_switch is not None and self.is_fully_idle():
+        if self._pending_switch is not None and self.running_batch is None:
             name, path = self._pending_switch
             self._execute_model_switch(name, path)
 
