@@ -441,6 +441,7 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.active_model_name = self.server_args.served_model_name or self.server_args.model_path
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
