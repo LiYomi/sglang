@@ -1754,6 +1754,12 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+
+        # Multi-model: trigger switch if request targets a different model
+        target = getattr(recv_req, "model_name", None)
+        if target and target != self.active_model_name:
+            self._prepare_model_switch(target)
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
