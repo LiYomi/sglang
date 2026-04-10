@@ -461,9 +461,11 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         runner.req_to_token_pool = _kv_cached["req_to_token_pool"]
         runner.token_to_kv_pool = _kv_cached["token_to_kv_pool"]
         runner.token_to_kv_pool_allocator = _kv_cached["token_to_kv_pool_allocator"]
-        runner.max_total_num_tokens = _kv_cached["max_total_num_tokens"]
         runner.max_running_requests = _kv_cached["max_running_requests"]
         runner.token_to_kv_pool_allocator.clear()
+        # Recompute max_total_num_tokens from allocator's actual size
+        # (KV region may be smaller than cached due to runtime size changes)
+        runner.max_total_num_tokens = runner.token_to_kv_pool_allocator.available_size()
         # Force flush: tree_cache.reset() + allocator.clear() (bypass idle check)
         scheduler.tree_cache.reset()
         if scheduler.token_to_kv_pool_allocator is not None:
