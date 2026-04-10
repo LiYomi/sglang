@@ -454,13 +454,8 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     if _kv_cached:
         if "kv_cache" in bump.regions:
             bump.release_region("kv_cache")
-        # Estimate runtime size from _init_runtime_region logic
-        from sglang.srt.environ import envs
-        _ws = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
-        archs = getattr(runner.model_config.hf_config, "architectures", []) or []
-        if any(a.startswith(("Qwen2", "Qwen3", "MiMo")) for a in archs):
-            _ws = max(_ws, 512 * 1024 * 1024)
-        _kv_cap = min(_kv_cached["kv_region_capacity"], bump.get_available_bytes() - _ws)
+        runner._init_runtime_region()
+        _kv_cap = min(_kv_cached["kv_region_capacity"], bump.get_available_bytes())
         _kv_cap = max(_kv_cap, 0)
         bump.allocate_region("kv_cache", _kv_cap)
         runner.req_to_token_pool = _kv_cached["req_to_token_pool"]
