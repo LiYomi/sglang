@@ -1203,7 +1203,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 + 4                                        # num_token_non_padded (int32)
                 + max_num_token * vocab_size * 4            # next_token_logits_buffer (float32)
             )
-            buf_size = int(buf_size * 1.5)  # 10% headroom for alignment + misc
+            buf_size = int(buf_size * 1.1)  # 10% headroom for alignment
 
         total_size = ws_size + buf_size
         if "runtime" in bump.regions:
