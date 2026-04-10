@@ -87,7 +87,7 @@ def test_multi_round_stability(base_url, model_a, model_b, rounds=5):
     """Test: switch A↔B many times, verify stability."""
     print(f'\n=== Test: Multi-Round Stability ({rounds} rounds) ===')
 
-    prompt = 'What is the meaning of life?'
+    prompt = 'Hello, I am a'
     baseline_a = None
     baseline_b = None
 
