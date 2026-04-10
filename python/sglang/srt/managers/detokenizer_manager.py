@@ -343,7 +343,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # Multi-model: select tokenizer by model_name
         _name = recv_obj.model_name
-        logger.debug(f"Detokenizer: model_name={_name}, available={list(self.model_tokenizers.keys())}")
         if _name and _name in self.model_tokenizers:
             self.tokenizer = self.model_tokenizers[_name]
 
