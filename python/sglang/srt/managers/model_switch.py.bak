@@ -189,7 +189,7 @@ def _serialize_cpu_state_dict(cpu_sd, padded_len):
     return PreloadManager._serialize_params(cpu_sd, padded_len, 1, padded_len)
 
 
-def _scatter_gather_weights(si, blocks, bump, weights_start, cpu_sd, total_weight_target, layer_map=None):
+def _scatter_gather_weights(si, blocks, bump, weights_start, cpu_sd, total_weight_target):
     """D2D gather valid chunks from staging, H2D corrupted chunks from CPU.
 
     T3 optimization: consecutive valid/invalid chunks are merged into runs.
@@ -252,13 +252,13 @@ def _scatter_gather_weights(si, blocks, bump, weights_start, cpu_sd, total_weigh
             with torch.cuda.stream(d2d_stream):
                 for bi in range(si.num_blocks):
                     src = blocks[_ub + bi].view(-1).view(torch.uint8)[src_off : src_off + nbytes]
-                    dst = weights_start + bi * si.staged_per_block + byte_off_start
+                    dst = weights_start + (_ub + bi) * si.staged_per_block + byte_off_start
                     bump.buffer[dst : dst + nbytes].copy_(src, non_blocking=True)
             d2d_bytes += nbytes * si.num_blocks
         elif cpu_stream is not None:
             with torch.cuda.stream(h2d_stream):
                 for bi in range(si.num_blocks):
-                    cpu_off = bi * si.staged_per_block + byte_off_start
+                    cpu_off = (_ub + bi) * si.staged_per_block + byte_off_start
                     dst = weights_start + cpu_off
                     bump.buffer[dst : dst + nbytes].copy_(
                         cpu_stream[cpu_off : cpu_off + nbytes], non_blocking=True
@@ -271,17 +271,27 @@ def _scatter_gather_weights(si, blocks, bump, weights_start, cpu_sd, total_weigh
             f"(copies: {len(runs)*si.num_blocks} vs old {num_chunks*si.num_blocks})"
         )
 
+    # H2D for unsafe blocks (blocks within expanded weights zone, not staged)
+    _ub = si.unsafe_blocks
+    if _ub > 0 and cpu_sd is not None:
+        unsafe_bytes = _ub * si.staged_per_block
+        with torch.cuda.stream(h2d_stream):
+            _h2d_remaining_params(
+                cpu_sd, bump,
+                weights_start,  # start from beginning
+                0, unsafe_bytes,  # H2D the first unsafe_bytes
+            )
+        h2d_bytes += unsafe_bytes
+        logger.info(f"  H2D unsafe blocks: {_ub} blocks, {unsafe_bytes/1024**2:.1f}MB")
+
     # H2D for unstaged params (didn't fit in staging)
-    # Note: unsafe blocks don't need separate H2D because staging data starts
-    # from param byte 0 (staged in safe blocks, D2D'd to bump offset 0).
-    _total_covered = si.total_staged_bytes
+    _total_covered = si.unsafe_blocks * si.staged_per_block + si.total_staged_bytes
     if cpu_sd is not None and _total_covered < total_weight_target:
         with torch.cuda.stream(h2d_stream):
             _h2d_remaining_params(
                 cpu_sd, bump,
-                weights_start,
+                weights_start + _total_covered,
                 _total_covered, total_weight_target,
-                layer_map=layer_map,
             )
         h2d_bytes += total_weight_target - _total_covered
 
@@ -290,57 +300,40 @@ def _scatter_gather_weights(si, blocks, bump, weights_start, cpu_sd, total_weigh
     return d2d_bytes, h2d_bytes
 
 
-def _h2d_remaining_params(cpu_sd: dict, bump, weights_start: int,
-                          skip_bytes: int, total_bytes: int, layer_map=None):
-    """H2D params that weren't staged, using layer_map for correct offsets.
+def _h2d_remaining_params(cpu_sd: dict, bump, dst_offset: int, skip_bytes: int, total_bytes: int):
+    """H2D params that weren't staged (the tail of the byte stream).
 
-    If layer_map is provided, each param is placed at its exact bump offset
-    (from create_tensor). Only params with offset >= skip_bytes are copied.
+    Both skip_bytes and total_bytes are in aligned-stream coordinates
+    (each param occupies ceil(raw_bytes / 256) * 256 bytes), matching
+    the bump allocator's create_tensor layout.
     """
-    if layer_map:
-        for ls in layer_map:
-            rel_offset = ls.offset - weights_start
-            if rel_offset + ls.nbytes <= skip_bytes:
-                continue
-            if rel_offset >= total_bytes:
-                continue
-            tensor = cpu_sd.get(ls.name)
-            if tensor is None:
-                continue
-            raw_bytes = min(ls.nbytes, tensor.numel() * tensor.element_size())
-            # Handle partial overlap with skip_bytes
-            start_in_param = max(0, skip_bytes - rel_offset)
-            take = min(raw_bytes - start_in_param, total_bytes - max(rel_offset, skip_bytes))
-            if take <= 0:
-                continue
-            cpu_bytes = tensor.contiguous().view(-1).view(torch.uint8)[start_in_param : start_in_param + take]
-            write_off = weights_start + max(rel_offset, skip_bytes)
-            bump.buffer[write_off : write_off + take].copy_(cpu_bytes, non_blocking=True)
-    else:
-        # Fallback: sequential iteration with 256B alignment
-        _ALIGNMENT = 256
-        def _align_up(n):
-            return (n + _ALIGNMENT - 1) & ~(_ALIGNMENT - 1)
-        pos = 0
-        for name, tensor in cpu_sd.items():
-            raw_bytes = tensor.numel() * tensor.element_size()
-            aligned_bytes = _align_up(raw_bytes)
-            end = pos + aligned_bytes
-            if end <= skip_bytes:
-                pos = end
-                continue
-            start_in_param = max(0, skip_bytes - pos)
-            raw_remaining = raw_bytes - start_in_param
-            space_left = total_bytes - max(pos, skip_bytes)
-            take = min(raw_remaining, space_left)
-            if take <= 0:
-                break
-            cpu_bytes = tensor.contiguous().view(-1).view(torch.uint8)[start_in_param : start_in_param + take]
-            write_off = weights_start + max(pos, skip_bytes)
-            bump.buffer[write_off : write_off + take].copy_(cpu_bytes, non_blocking=True)
+    _ALIGNMENT = 256
+    def _align_up(n):
+        return (n + _ALIGNMENT - 1) & ~(_ALIGNMENT - 1)
+
+    pos = 0  # aligned position in the byte stream
+    for name, tensor in cpu_sd.items():
+        raw_bytes = tensor.numel() * tensor.element_size()
+        aligned_bytes = _align_up(raw_bytes)
+        end = pos + aligned_bytes
+        if end <= skip_bytes:
             pos = end
-            if pos >= total_bytes:
-                break
+            continue
+        # This param has some bytes beyond skip_bytes
+        # start_in_param: how many raw bytes to skip within this param
+        start_in_param = max(0, skip_bytes - pos)
+        # Only copy raw bytes (not padding) — bump allocator already zeroed padding
+        raw_remaining = raw_bytes - start_in_param
+        space_left = total_bytes - max(pos, skip_bytes)
+        take = min(raw_remaining, space_left)
+        if take <= 0:
+            break
+        cpu_bytes = tensor.contiguous().view(-1).view(torch.uint8)[start_in_param : start_in_param + take]
+        write_off = dst_offset + max(pos, skip_bytes) - skip_bytes
+        bump.buffer[write_off : write_off + take].copy_(cpu_bytes, non_blocking=True)
+        pos = end
+        if pos >= total_bytes:
+            break
 
 
 def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
@@ -507,7 +500,6 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
             weights_start=weights_start,
             cpu_sd=h2d_src,
             total_weight_target=total_target,
-            layer_map=layer_map,
         )
         _t_d2d_end = time.perf_counter()
         logger.info(f"  D2D scatter-gather: d2d={d2d_bytes/1024**2:.1f}MB h2d={h2d_bytes/1024**2:.1f}MB time={(_t_d2d_end-_t_d2d)*1000:.1f}ms")

@@ -129,6 +129,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
         self._lifo_mode = lifo_mode
         self._staging_lock = None  # set during preload for thread-safe free_pages access
+        self._preload_mgr = None   # set during preload for chunk dirty tracking (Issue M)
         self.clear()
 
     def clear(self):
@@ -156,6 +157,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
             select_index = self.free_pages[:need_size]
             self.free_pages = self.free_pages[need_size:]
+            # Notify staging of potential corruption (Issue M)
+            if self._preload_mgr is not None:
+                self._preload_mgr.mark_dirty_pages(select_index)
             return select_index
         finally:
             if _lk: _lk.release()

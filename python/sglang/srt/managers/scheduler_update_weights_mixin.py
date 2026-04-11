@@ -252,6 +252,7 @@ class SchedulerUpdateWeightsMixin:
             logger.error(f"Auto-switch failed: {e}", exc_info=True)
         finally:
             self._pending_switch = None
+            self._preload_attempted_target = None  # allow preload for next switch
 
     def _check_preload(self: "Scheduler"):
         """Check if a model needs preloading. Called from scheduler idle loop.
@@ -280,7 +281,11 @@ class SchedulerUpdateWeightsMixin:
                 and self._preload_manager.is_valid):
             return
 
-        torch.cuda.synchronize()
+        # Already attempted preload for this target (success or failure)?
+        # Reset only when target changes or switch completes.
+        if self._preload_attempted_target == target:
+            return
+
         self._start_weight_preload(target)
 
     def register_model(self: "Scheduler", recv_req):
@@ -337,6 +342,7 @@ class SchedulerUpdateWeightsMixin:
             _min_free = kv_pool.k_buffer[0].shape[0]
 
         from sglang.srt.mem_cache.weight_staging import PreloadManager
+        from sglang.srt.managers.model_switch import _runtime_cache
         if self._preload_manager is None:
             self._preload_manager = PreloadManager()
 
@@ -345,11 +351,30 @@ class SchedulerUpdateWeightsMixin:
         # Create shared lock for thread-safe free_pages access
         _alloc_lock = threading.Lock()
         _allocator._staging_lock = _alloc_lock
+        # Set preload manager ref for chunk dirty tracking (Issue M)
+        _allocator._preload_mgr = preload_mgr
+
+        # Layout safety: compute max weights across current and target models
+        _target_weight_bytes = sum(
+            t.numel() * t.element_size() for t in cpu_state_dict.values()
+        )
+        _current_weight_bytes = bump.regions["weights"].capacity if "weights" in bump.regions else 0
+        _max_weights_bytes = max(_current_weight_bytes, _target_weight_bytes)
+
+        # Right boundary safety: max runtime across current and target models
+        _current_runtime_bytes = bump.regions["runtime"].capacity if "runtime" in bump.regions else 0
+        _target_runtime_bytes = _runtime_cache.get(target_model_name, _current_runtime_bytes)
+        _max_runtime_bytes = max(_current_runtime_bytes, _target_runtime_bytes)
+        _bump_total_bytes = bump.total_bytes
 
         def _do_preload():
+            import traceback as _tb
+            import time as _time_pl
             try:
+                _t_contig = _time_pl.perf_counter()
                 sd = {k: v.contiguous() for k, v in cpu_state_dict.items()}
-
+                logger.info(f"  TIMING: contiguous_copy={(_time_pl.perf_counter()-_t_contig)*1000:.0f}ms ({len(cpu_state_dict)} tensors)")
+                _t_preload = _time_pl.perf_counter()
                 preload_mgr.start_preload(
                     model_name=target_model_name,
                     cpu_state_dict=sd,
@@ -358,16 +383,32 @@ class SchedulerUpdateWeightsMixin:
                     min_free_slot=_min_free,
                     allocator=_allocator,
                     alloc_lock=_alloc_lock,
+                    max_weights_bytes=_max_weights_bytes,
+                    max_runtime_bytes=_max_runtime_bytes,
+                    bump_total_bytes=_bump_total_bytes,
                 )
+                logger.info(f"  TIMING: start_preload_total={(_time_pl.perf_counter()-_t_preload)*1000:.0f}ms")
             except Exception as e:
                 logger.error(f"Preload thread error: {e}", exc_info=True)
             finally:
+                logger.info(f"Preload thread exiting for {target_model_name}, is_valid={preload_mgr.is_valid}")
                 # Remove lock after preload completes — no contention outside preload
                 _allocator._staging_lock = None
+                # Keep _preload_mgr alive — dirty flags needed until switch consumes them
 
+        logger.info(
+            f"_start_weight_preload: target={target_model_name} "
+            f"bump.left_offset={bump.left_offset} "
+            f"current_weights_cap={_current_weight_bytes} "
+            f"target_weight_bytes={_target_weight_bytes} "
+            f"max_weights_bytes={_max_weights_bytes} "
+            f"max_runtime_bytes={_max_runtime_bytes} "
+            f"min_free_slot={_min_free} "
+            f"free_pages_count={len(_allocator.free_pages)}")
         self._preload_thread = threading.Thread(target=_do_preload, daemon=True)
         self._preload_thread.start()
         logger.info(f"_start_weight_preload: background thread started for {target_model_name}")
+        self._preload_attempted_target = target_model_name
 
 
 def _export_static_state(model):

@@ -59,7 +59,6 @@ class PreloadManager:
         self.model_name: Optional[str] = None
         self.scatter_info: Optional[ScatterStagingInfo] = None
         self._block_tensors: List[torch.Tensor] = []
-        self.layer_map = None  # List[LayerSlice] from bump allocator
         # Chunk pollution tracking (Issue M)
         self._chunk_dirty: Optional[List[bool]] = None
         self._staging_start: int = 0
@@ -119,8 +118,6 @@ class PreloadManager:
                 f"Non-uniform KV head dims not supported yet."
             )
 
-        import time as _time
-        _t_layout = _time.perf_counter()
         staging_start, staging_rows, staged_per_block, staged_bytes, unsafe_blocks = (
             self._compute_layout(
                 pool_size, row_size, num_blocks, min_free_slot, cpu_state_dict,
@@ -130,34 +127,27 @@ class PreloadManager:
                 bump_total_bytes=bump_total_bytes,
             )
         )
-        logger.info(f"  TIMING: layout={(_time.perf_counter()-_t_layout)*1000:.0f}ms")
         if staged_bytes == 0:
             logger.info(f"Preload: no staging capacity for {model_name} (staged_bytes=0)")
             return
-
-        # Reduce num_blocks by unsafe count (compute_layout only modifies local copy)
-        num_blocks -= unsafe_blocks
 
         # Skip unsafe blocks (blocks within expanded weights zone)
         safe_blocks = blocks[unsafe_blocks:] if unsafe_blocks > 0 else blocks
         self._block_tensors = blocks  # Keep all for D2D gather offset calculation
         self._unsafe_blocks = unsafe_blocks
 
-        # --- Get layer_map for offset mapping ---
-        _layer_map = bump.get_layer_map(model_name) if bump else None
-        _weights_start = bump.regions["weights"].start if bump and "weights" in bump.regions else 0
-        self.layer_map = _layer_map
+        # --- Serialize CPU params → flat byte stream, padded to full block coverage ---
+        cpu_stream = self._serialize_params(cpu_state_dict, staged_bytes,
+                                            num_blocks, staged_per_block)
 
-        # --- H2D scatter directly from pinned CPU params (no intermediate buffer) ---
-        _t_h2d = _time.perf_counter()
+        # --- H2D scatter with pipelined locking ---
         chunk_rows = max(1, H2D_CHUNK_SIZE // row_size)
         total_written = self._h2d_scatter(
-            safe_blocks, cpu_state_dict, _layer_map, _weights_start,
-            num_blocks, pool_size, row_size,
+            blocks, cpu_stream, num_blocks, pool_size, row_size,
             staging_start, staged_per_block, chunk_rows,
             allocator, alloc_lock,
         )
-        logger.info(f"  TIMING: h2d_scatter={(_time.perf_counter()-_t_h2d)*1000:.0f}ms written={total_written/1024**2:.0f}MB")
+
         self.scatter_info = ScatterStagingInfo(
             staging_start=staging_start,
             staging_rows=staging_rows,
@@ -218,11 +208,19 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
         # fall within the expanded weights zone. Instead of per-row min_safe_row
         # (which can exceed pool_size), compute per-block: skip fully-unsafe blocks.
         unsafe_blocks = 0
+        min_safe_row = 0
         if max_weights_bytes > kv_pool_physical_start and kv_pool_physical_start > 0:
             unsafe_bytes = max_weights_bytes - kv_pool_physical_start
             block_bytes = pool_size * row_size
             if block_bytes > 0:
                 unsafe_blocks = math.ceil(unsafe_bytes / block_bytes)
+            # For the first partially-unsafe block, rows below this are unsafe
+            partial_block_unsafe = unsafe_bytes - (unsafe_blocks - 1) * block_bytes if unsafe_blocks > 0 else 0
+            if partial_block_unsafe > 0 and partial_block_unsafe < block_bytes:
+                # The last "unsafe" block is only partially unsafe; include it
+                # but set min_safe_row to skip the unsafe rows within it
+                unsafe_blocks -= 1
+                min_safe_row = math.ceil(partial_block_unsafe / row_size)
             num_blocks -= unsafe_blocks
             if num_blocks <= 0:
                 logger.info(f"  _compute_layout: all {num_blocks + unsafe_blocks} blocks unsafe")
@@ -240,11 +238,11 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
         else:
             max_safe_row = pool_size
 
-        effective_floor = min_free_slot
+        effective_floor = max(min_free_slot, min_safe_row)
         effective_ceiling = min(pool_size, max_safe_row)
         free_rows = effective_ceiling - effective_floor
         if free_rows <= 0:
-            logger.info(f"  _compute_layout: free_rows<=0, pool_size={pool_size} max_safe_row={max_safe_row} min_free_slot={min_free_slot} effective_floor={effective_floor} effective_ceiling={effective_ceiling}")
+            logger.info(f"  _compute_layout: free_rows<=0, pool_size={pool_size} min_safe_row={min_safe_row} max_safe_row={max_safe_row} min_free_slot={min_free_slot} effective_floor={effective_floor} effective_ceiling={effective_ceiling}")
             return 0, 0, 0, 0, 0
 
         capacity_per_block = free_rows * row_size
@@ -268,8 +266,8 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
         staging_start = effective_ceiling - staging_rows
 
         # Double-check: staging must be in safe zone
-        assert staging_start >= effective_floor and staging_start + staging_rows <= max_safe_row, (
-            f"staging_start={staging_start} effective_floor={effective_floor} "
+        assert staging_start >= min_safe_row and staging_start + staging_rows <= max_safe_row, (
+            f"staging_start={staging_start} min_safe_row={min_safe_row} "
             f"staging_end={staging_start + staging_rows} max_safe_row={max_safe_row}, "
             f"layout safety violated"
         )
@@ -280,8 +278,9 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
             f"kv_pool_physical_start={kv_pool_physical_start}")
         _unsafe = max_weights_bytes - kv_pool_physical_start if max_weights_bytes > kv_pool_physical_start and kv_pool_physical_start > 0 else 0
         logger.info(
-            f"  LAYOUT SAFETY: unsafe_bytes={_unsafe} unsafe_blocks={unsafe_blocks} "
-            f"effective_floor={effective_floor} free_rows={free_rows}")
+            f"  LAYOUT SAFETY: unsafe_bytes={_unsafe} min_safe_row={min_safe_row} "
+            f"effective_floor=max(min_free_slot={min_free_slot}, min_safe_row={min_safe_row})={max(min_free_slot, min_safe_row)} "
+            f"free_rows={free_rows}")
         _staging_phys_offset = kv_pool_physical_start + staging_start * row_size
         _staging_phys_end = kv_pool_physical_start + (staging_start + staging_rows) * row_size
         logger.info(
@@ -296,55 +295,43 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _serialize_params(cpu_state_dict, staged_bytes, num_blocks, staged_per_block,
-                          layer_map=None, weights_start=0):
-        """Serialize CPU params into a pinned flat byte stream matching bump layout.
+    def _serialize_params(cpu_state_dict, staged_bytes, num_blocks, staged_per_block):
+        """Serialize CPU params into a flat byte stream with 256-byte alignment.
 
-        If layer_map is provided, each param is placed at its correct offset
-        (matching the bump allocator's create_tensor layout). Otherwise falls
-        back to sequential iteration order.
+        Each parameter is padded to 256-byte alignment to match bump allocator's
+        create_tensor layout. Without this padding, D2D writes would place data
+        at wrong offsets relative to the model's parameter views.
         """
-        import time as _time_ser
-        padded_len = num_blocks * staged_per_block
-        _t_alloc = _time_ser.perf_counter()
-        stream = torch.zeros(padded_len, dtype=torch.uint8, pin_memory=True)
-        logger.info(f"    TIMING serialize_alloc: {(_time_ser.perf_counter()-_t_alloc)*1000:.0f}ms ({padded_len/1024**3:.1f}GB)")
-        _t_copy = _time_ser.perf_counter()
+        _ALIGNMENT = 256
 
-        if layer_map:
-            # Place each param at the exact offset used by bump allocator
-            for ls in layer_map:
-                rel_offset = ls.offset - weights_start
-                if rel_offset < 0 or rel_offset >= staged_bytes:
-                    continue
-                tensor = cpu_state_dict.get(ls.name)
-                if tensor is None:
-                    continue
-                raw_bytes = min(ls.nbytes, tensor.numel() * tensor.element_size())
-                take = min(raw_bytes, staged_bytes - rel_offset)
-                if take <= 0:
-                    continue
-                stream[rel_offset : rel_offset + take].copy_(
-                    tensor.contiguous().view(-1).view(torch.uint8)[:take]
-                )
-        else:
-            # Fallback: sequential iteration with 256B alignment
-            _ALIGNMENT = 256
-            def _align_up(n):
-                return (n + _ALIGNMENT - 1) & ~(_ALIGNMENT - 1)
-            pos = 0
-            for name, tensor in cpu_state_dict.items():
-                raw_bytes = tensor.numel() * tensor.element_size()
-                aligned_bytes = _align_up(raw_bytes)
-                take = min(aligned_bytes, staged_bytes - pos)
-                if take <= 0:
-                    break
-                raw_take = min(raw_bytes, take)
-                stream[pos : pos + raw_take].copy_(
-                    tensor.contiguous().view(-1).view(torch.uint8)[:raw_take]
-                )
-                pos += take
-        logger.info(f"    TIMING serialize_copy: {(_time_ser.perf_counter()-_t_copy)*1000:.0f}ms")
+        def _align_up(n):
+            return (n + _ALIGNMENT - 1) & ~(_ALIGNMENT - 1)
+
+        chunks = []
+        pos = 0
+        for name, tensor in cpu_state_dict.items():
+            raw_bytes = tensor.numel() * tensor.element_size()
+            aligned_bytes = _align_up(raw_bytes)
+            take = min(aligned_bytes, staged_bytes - pos)
+            if take <= 0:
+                break
+            # Write raw param bytes
+            raw_take = min(raw_bytes, take)
+            chunks.append(tensor.contiguous().view(-1).view(torch.uint8)[:raw_take])
+            # Add alignment padding
+            pad = take - raw_take
+            if pad > 0:
+                chunks.append(torch.zeros(pad, dtype=torch.uint8))
+            pos += take
+        stream = torch.cat(chunks)
+
+        # Pad so every block has a full staged_per_block section.
+        padded_len = num_blocks * staged_per_block
+        if len(stream) < padded_len:
+            stream = torch.cat([
+                stream,
+                torch.zeros(padded_len - len(stream), dtype=torch.uint8),
+            ])
         return stream
 
     # ------------------------------------------------------------------
@@ -352,97 +339,41 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
     # ------------------------------------------------------------------
 
     def _h2d_scatter(
-        self, blocks, cpu_state_dict, layer_map, weights_start,
-        num_blocks, pool_size, row_size,
+        self, blocks, cpu_stream, num_blocks, pool_size, row_size,
         staging_start, staged_per_block, chunk_rows,
         allocator, alloc_lock,
     ):
-        """Direct H2D from pinned CPU params to GPU block tails. No intermediate buffer.
+        """Pipelined H2D with event-based unlock. Returns total bytes written.
 
-        Uses layer_map to map each param to the correct block and position.
-        Block bi holds weight layout bytes [bi*spb, (bi+1)*spb).
-        Chunk-based row locking preserved for KV allocator safety.
+        For each chunk:
+          1. Lock rows (remove from allocator free_pages)
+          2. Launch H2D copies for all blocks (async on h2d_stream)
+          3. Record CUDA event
+          4. Move to next chunk immediately (no sync)
+
+        Between launches, opportunistically query earlier events and unlock
+        completed chunks' rows. After all launches, drain remaining events.
         """
-        import time as _time_h2d
-        import torch
-
-        # --- Pre-compute per-block param copy plan ---
-        _t_plan = _time_h2d.perf_counter()
-        block_params = [[] for _ in range(num_blocks)]
-
-        if layer_map:
-            for ls in layer_map:
-                t = cpu_state_dict.get(ls.name)
-                if t is None:
-                    continue
-                rel = ls.offset - weights_start
-                raw = min(ls.nbytes, t.numel() * t.element_size())
-                if rel < 0 or raw <= 0:
-                    continue
-                cpu_view = t.contiguous().view(-1).view(torch.uint8)[:raw]
-                first_bi = rel // staged_per_block
-                last_bi = (rel + raw - 1) // staged_per_block
-                for bi in range(max(0, first_bi), min(last_bi + 1, num_blocks)):
-                    blk_start = bi * staged_per_block
-                    blk_end = blk_start + staged_per_block
-                    cs = max(rel, blk_start)
-                    ce = min(rel + raw, blk_end)
-                    if ce <= cs:
-                        continue
-                    block_params[bi].append((cs - blk_start, cpu_view[cs - rel : ce - rel]))
-        else:
-            _ALIGNMENT = 256
-            pos = 0
-            for name, tensor in cpu_state_dict.items():
-                raw = tensor.numel() * tensor.element_size()
-                aligned = (raw + _ALIGNMENT - 1) & ~(_ALIGNMENT - 1)
-                if pos + aligned > num_blocks * staged_per_block:
-                    break
-                cpu_view = tensor.contiguous().view(-1).view(torch.uint8)[:raw]
-                first_bi = pos // staged_per_block
-                last_bi = (pos + raw - 1) // staged_per_block
-                for bi in range(max(0, first_bi), min(last_bi + 1, num_blocks)):
-                    blk_start = bi * staged_per_block
-                    blk_end = blk_start + staged_per_block
-                    cs = max(pos, blk_start)
-                    ce = min(pos + raw, blk_end)
-                    if ce <= cs:
-                        continue
-                    block_params[bi].append((cs - blk_start, cpu_view[cs - pos : ce - pos]))
-                pos += aligned
-
-        _plan_ms = (_time_h2d.perf_counter() - _t_plan) * 1000
-        _total_ops = sum(len(bp) for bp in block_params)
-        # One-shot pinned check
-        _pinned_count = 0
-        _unpinned_count = 0
-        _total_check = 0
-        for _bp in block_params[:3]:  # check first 3 blocks
-            for (_off, _src) in _bp:
-                _total_check += 1
-                if _src.is_pinned():
-                    _pinned_count += 1
-                else:
-                    _unpinned_count += 1
-        logger.info(f"    PINNED CHECK: {_pinned_count} pinned, {_unpinned_count} unpinned out of {_total_check} checked")
-        logger.info(f"    H2D plan: {_plan_ms:.0f}ms, {_total_ops} copy ops across {num_blocks} blocks")
-
-        # --- Pipelined H2D with chunk-based locking ---
         staging_rows = math.ceil(staged_per_block / row_size)
-        chunk_end = staging_start + staging_rows - 1
+        chunk_end = staging_start + staging_rows - 1  # top of actual staging region
         written_per_block = 0
         total_written = 0
+
+        # Pending unlocks: list of (event, locked_rows_tensor)
         pending_unlocks: List[tuple] = []
 
         while chunk_end >= staging_start and written_per_block < staged_per_block:
             actual_rows = min(chunk_rows, chunk_end - staging_start + 1)
             chunk_start = chunk_end - actual_rows + 1
             chunk_bytes = min(actual_rows * row_size, staged_per_block - written_per_block)
+
             if chunk_bytes <= 0:
                 break
 
+            # --- Opportunistic unlock: query earlier events ---
             self._drain_completed_unlocks(pending_unlocks, allocator, alloc_lock)
 
+            # --- Lock: remove this chunk's rows from allocator ---
             locked = None
             if allocator is not None:
                 _lk = alloc_lock
@@ -453,7 +384,7 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
                     locked = fp[mask]
                     if locked.numel() < actual_rows:
                         logger.info(
-                            f"Preload: early exit -- only {locked.numel()}/{actual_rows} "
+                            f"Preload: early exit — only {locked.numel()}/{actual_rows} "
                             f"rows free in [{chunk_start}, {chunk_end}]"
                         )
                         locked = None
@@ -462,45 +393,40 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
                 finally:
                     if _lk: _lk.release()
 
-            tail_off = staged_per_block - written_per_block - chunk_bytes
-            chunk_written = 0
-            _n_copies = 0
-            _t_chunk = _time_h2d.perf_counter()
-
+            # --- H2D: all blocks for this chunk (async, no sync) ---
+            actual_total = 0
             with torch.cuda.stream(self.h2d_stream):
                 for bi in range(num_blocks):
-                    flat = blocks[bi].view(-1).view(torch.uint8)
-                    dst_base = chunk_start * row_size
-                    for (off_in_blk, src_bytes) in block_params[bi]:
-                        param_end = off_in_blk + len(src_bytes)
-                        if param_end <= tail_off or off_in_blk >= tail_off + chunk_bytes:
-                            continue
-                        cs = max(off_in_blk, tail_off)
-                        ce = min(param_end, tail_off + chunk_bytes)
-                        n = ce - cs
-                        src_s = cs - off_in_blk
-                        dst_s = dst_base + (cs - tail_off)
-                        flat[dst_s : dst_s + n].copy_(
-                            src_bytes[src_s : src_s + n], non_blocking=True
-                        )
-                        chunk_written += n
-                        _n_copies += 1
+                    src_off = bi * staged_per_block + (staged_per_block - written_per_block - chunk_bytes)
+                    if src_off + chunk_bytes > len(cpu_stream):
+                        actual = len(cpu_stream) - src_off
+                        if actual <= 0:
+                            break
+                    else:
+                        actual = chunk_bytes
 
+                    dst_off = chunk_start * row_size
+                    flat = blocks[bi].view(-1).view(torch.uint8)
+                    flat[dst_off : dst_off + actual].copy_(
+                        cpu_stream[src_off : src_off + actual],
+                        non_blocking=True,
+                    )
+                    actual_total += actual
+
+            # --- Record event for this chunk ---
             event = torch.cuda.Event()
             event.record(self.h2d_stream)
+
             if allocator is not None and locked is not None and locked.numel() > 0:
                 pending_unlocks.append((event, locked))
 
-            total_written += chunk_written
-            _chunk_ms = (_time_h2d.perf_counter() - _t_chunk) * 1000
-            if _chunk_ms > 100:
-                logger.info(f"      chunk: {_chunk_ms:.0f}ms {_n_copies} copies {chunk_written/1024**2:.0f}MB tail_off={tail_off}")
+            total_written += actual_total
             written_per_block += chunk_bytes
             chunk_end = chunk_start - 1
 
-        _total_chunks = math.ceil(staged_per_block / (chunk_rows * row_size)) if chunk_rows > 0 else 0
-        logger.info(f"    H2D scatter done: {total_written/1024**2:.0f}MB in {_total_chunks} chunks")
+        # --- Drain all remaining pending unlocks ---
         self._drain_all_unlocks(pending_unlocks, allocator, alloc_lock)
+
         return total_written
 
     @staticmethod
@@ -616,7 +542,6 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
         self.h2d_stream.synchronize()
         self.scatter_info = None
         self._block_tensors = []
-        self.layer_map = None
         self._chunk_dirty = None
         self._staging_start = 0
         self._staging_end = 0

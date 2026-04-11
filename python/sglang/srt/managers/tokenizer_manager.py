@@ -511,7 +511,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            # Multi-model: use target model's tokenizer
+            # Multi-model: map 'model' -> 'model_name' for OpenAI-style APIs
+            if not getattr(obj, "model_name", None) and getattr(obj, "model", None):
+                obj.model_name = obj.model
             model_name = getattr(obj, "model_name", None)
             if model_name and model_name in self.model_tokenizers:
                 self.tokenizer = self.model_tokenizers[model_name]

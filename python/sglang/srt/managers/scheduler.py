@@ -724,6 +724,7 @@ class Scheduler(
             self._kv_transfer = None
         self._preload_thread = None
         self._preload_manager = None
+        self._preload_attempted_target = None  # dedup: prevent re-triggering for same target
         self._pending_switch = None
         self._prev_model_name = None
 
@@ -1755,6 +1756,7 @@ class Scheduler(
 
             # Multi-model: trigger switch if request targets a different model
             target = getattr(recv_req, "model_name", None)
+            open("/tmp/switch_diag.log","a").write(f"SCHED: target={target}, active={self.active_model_name}\n")
             if target and target != self.active_model_name:
                 self._prepare_model_switch(target)
 
