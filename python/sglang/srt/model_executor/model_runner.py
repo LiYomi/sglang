@@ -1083,10 +1083,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Calculate total size and allocate/reset weights region
         # Only count persistent buffers (in state_dict). Non-persistent ones
         # (cos_sin_cache etc.) are computed on GPU, not stored in bump.
-        param_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        # Include 256B alignment per tensor (matches bump.create_tensor layout)
+        from sglang.srt.mem_cache.bump_vram_manager import _align_up
+        param_bytes = sum(_align_up(p.numel() * p.element_size()) for p in self.model.parameters())
         sd_keys = set(self.model.state_dict().keys())
         persistent_buf_bytes = sum(
-            b.numel() * b.element_size() for n, b in self.model.named_buffers()
+            _align_up(b.numel() * b.element_size()) for n, b in self.model.named_buffers()
             if b is not None and b.numel() > 0 and n in sd_keys
         )
         total_bytes = param_bytes + persistent_buf_bytes
@@ -1099,6 +1101,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 bump.reset_region("weights", total_bytes)
             else:
                 bump.allocate_region("weights", total_bytes)
+
+        # Clear stale layer_map entries for this model to prevent accumulation
+        # (each _migrate_params_to_bump call appends; without clearing, entries double)
+        if bump._current_model and bump._current_model in bump.layer_map:
+            bump.layer_map[bump._current_model] = []
 
         # Migrate parameters
         d2d_stream = torch.cuda.Stream() if staging_info else None

@@ -511,11 +511,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            # Multi-model: map 'model' -> 'model_name' for OpenAI-style APIs
-            if not getattr(obj, "model_name", None) and getattr(obj, "model", None):
-                obj.model_name = obj.model
+            # Multi-model: select tokenizer by model_name, reject unregistered
             model_name = getattr(obj, "model_name", None)
-            if model_name and model_name in self.model_tokenizers:
+            if model_name:
+                if model_name not in self.model_tokenizers:
+                    raise ValueError(
+                        f"Model '{model_name}' is not registered. "
+                        f"Available: {list(self.model_tokenizers.keys())}"
+                    )
                 self.tokenizer = self.model_tokenizers[model_name]
 
             await self._validate_and_resolve_lora(obj)

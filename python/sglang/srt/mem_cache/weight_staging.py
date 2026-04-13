@@ -37,23 +37,39 @@ logger = logging.getLogger(__name__)
 _batch_h2d_module = None
 def _get_batch_h2d():
     global _batch_h2d_module
-    if _batch_h2d_module is None:
-        try:
-            import importlib.util
-            _so = "/home/mxc/.cache/torch_extensions/py312_cu128/batch_h2d/batch_h2d.so"
+    if _batch_h2d_module is not None:
+        return _batch_h2d_module
+
+    import importlib.util
+    import os
+
+    # Try fast import from torch extension cache (avoids 3.5s load() overhead)
+    try:
+        from torch.utils.cpp_extension import _get_build_directory
+        _so = os.path.join(_get_build_directory("batch_h2d", False), "batch_h2d.so")
+        if os.path.isfile(_so):
             spec = importlib.util.spec_from_file_location("batch_h2d", _so)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             _batch_h2d_module = mod
-        except Exception:
-            from torch.utils.cpp_extension import load as _cpp_load
-            _batch_h2d_module = _cpp_load(
-                name="batch_h2d",
-                sources=["/home/mxc/sglang-feat-hot-switch/python/sglang/srt/mem_cache/csrc/batch_h2d.cpp"],
-                extra_include_paths=["/usr/local/cuda-12.8/targets/x86_64-linux/include"],
-                extra_ldflags=["-lcudart", "-L/usr/local/cuda-12.8/lib64"],
-                verbose=False,
-            )
+            return _batch_h2d_module
+    except Exception:
+        pass
+
+    # Fallback: JIT compile from source
+    from torch.utils.cpp_extension import load as _cpp_load, CUDA_HOME
+    _src = os.path.join(os.path.dirname(__file__), "csrc", "batch_h2d.cpp")
+    _cuda = CUDA_HOME or "/usr/local/cuda"
+    _batch_h2d_module = _cpp_load(
+        name="batch_h2d",
+        sources=[_src],
+        extra_include_paths=[
+            os.path.join(_cuda, "targets", os.uname().machine + "-linux", "include"),
+            os.path.join(_cuda, "include"),
+        ],
+        extra_ldflags=["-lcudart", f"-L{os.path.join(_cuda, 'lib64')}"],
+        verbose=False,
+    )
     return _batch_h2d_module
 
 H2D_CHUNK_SIZE = 32 * 1024 * 1024  # 32MB per block per round
@@ -307,8 +323,10 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
         logger.info(
             f"  LAYOUT SAFETY: unsafe_bytes={_unsafe} unsafe_blocks={unsafe_blocks} "
             f"effective_floor={effective_floor} free_rows={free_rows}")
-        _staging_phys_offset = kv_pool_physical_start + staging_start * row_size
-        _staging_phys_end = kv_pool_physical_start + (staging_start + staging_rows) * row_size
+        # Staging is in safe blocks (block[unsafe_blocks:]), compute actual physical address
+        _safe_block_phys_start = kv_pool_physical_start + unsafe_blocks * pool_size * row_size
+        _staging_phys_offset = _safe_block_phys_start + staging_start * row_size
+        _staging_phys_end = _safe_block_phys_start + (staging_start + staging_rows) * row_size
         logger.info(
             f"  LAYOUT RESULT: staging_start={staging_start} staging_rows={staging_rows} "
             f"staged_bytes={staged_bytes} staged_per_block={staged_per_block} "

@@ -159,7 +159,7 @@ class BumpVramAllocator:
         region._sub_offset += nbytes
         if tag == "weights" and name and self._current_model:
             self.layer_map.setdefault(self._current_model, []).append(
-                LayerSlice(name=name, offset=buf_start, nbytes=numel * elem_size)
+                LayerSlice(name=name, offset=buf_start, nbytes=nbytes)  # aligned size
             )
         return tensor
 

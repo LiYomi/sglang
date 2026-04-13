@@ -296,7 +296,8 @@ class SchedulerUpdateWeightsMixin:
         logger.info(f"Scheduler registered model: {recv_req.model_name} -> {recv_req.model_path}")
 
         # Notify detokenizer to pre-load tokenizer for this model
-        if hasattr(self, "send_to_detokenizer"):
+        _detoken = getattr(self, "send_to_detokenizer", None)
+        if _detoken is not None and getattr(_detoken, "socket", None) is not None:
             from sglang.srt.managers.io_struct import RegisterModelNotification
             self.send_to_detokenizer.socket.send_pyobj(
                 RegisterModelNotification(model_name=recv_req.model_name, model_path=recv_req.model_path)

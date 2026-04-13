@@ -219,10 +219,8 @@ class GenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
-    # Model name for multi-model serving (also accepts 'model' from OpenAI-style APIs)
+    # Model name for multi-model serving
     model_name: Optional[str] = None
-    # OpenAI-style 'model' field -> maps to model_name in __post_init__
-    model: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

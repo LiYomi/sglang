@@ -58,6 +58,10 @@ def _save_graph_cache(runner, model_name, memory_saver_adapter=None):
             "vmm_graph_tag": vmm_tag,
             "graph_runner": runner.graph_runner,
             "attn_backend": runner.attn_backend,
+            "piecewise_cuda_graph_runner": getattr(runner, "piecewise_cuda_graph_runner", None),
+            "attention_layers": getattr(runner, "attention_layers", None),
+            "moe_layers": getattr(runner, "moe_layers", None),
+            "moe_fusions": getattr(runner, "moe_fusions", None),
             "input_buffer_pool": dict(_forward_input_buffer_pool),
             "graph_pool_handle": _get_graph_pool(),
             "model_buffers": saved_buffers,
@@ -97,6 +101,24 @@ def _restore_graph_cache(runner, model_name, memory_saver_adapter=None):
         if saved_pool is not None:
             _set_graph_pool(saved_pool)
         runner.attn_backend = cached["attn_backend"]
+
+        # Restore attention/moe layers and piecewise runner
+        for attr in ("attention_layers", "moe_layers", "moe_fusions"):
+            saved_val = cached.get(attr)
+            if saved_val is not None:
+                setattr(runner, attr, saved_val)
+        pcg_runner = cached.get("piecewise_cuda_graph_runner")
+        runner.piecewise_cuda_graph_runner = pcg_runner  # None for models without piecewise
+        if pcg_runner is not None:
+            pcg_runner.attention_layers = runner.attention_layers
+            pcg_runner.moe_layers = runner.moe_layers
+            pcg_runner.moe_fusions = runner.moe_fusions
+            # Set capture stream for lazy recapture: torch.compile may recompile after
+            # model switch (guard failure from changed weight addresses), creating new
+            # backend instances with empty entries that need a stream for capture.
+            from sglang.srt.compilation import piecewise_context_manager as _pcm
+            if _pcm._pcg_capture_stream is None:
+                _pcm._pcg_capture_stream = torch.cuda.Stream()
 
         # Update stale internal references in restored attn_backend
         ab = runner.attn_backend
@@ -405,20 +427,21 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         and _preload_mgr.model_name == target_model_name
         and _preload_mgr.is_valid
     )
+    # TP > 1: all ranks must agree on D2D vs H2D path to avoid NCCL deadlock
+    _tp_size = scheduler.tp_size
+    _tp_cpu_group = getattr(scheduler, "tp_cpu_group", None)
+    if _tp_size > 1 and _tp_cpu_group is not None:
+        _staging_vote = torch.tensor([int(_has_staging)], dtype=torch.int32)
+        torch.distributed.all_reduce(_staging_vote, op=torch.distributed.ReduceOp.MIN,
+                                      group=_tp_cpu_group)
+        _has_staging = bool(_staging_vote.item())
     if _has_staging:
         _t_wait = time.perf_counter()
         _preload_mgr.wait_complete()
         logger.info(f"  wait_complete: {(time.perf_counter()-_t_wait)*1000:.1f}ms")
         _t_verify = time.perf_counter()
         _preload_mgr.verify_integrity(scheduler.token_to_kv_pool_allocator)
-        _t_verify_end = time.perf_counter()
-        logger.info(f"  verify_integrity: {(_t_verify_end-_t_verify)*1000:.1f}ms")
-        _si = _preload_mgr.scatter_info
-        _n_corrupted = sum(1 for v in (_si.chunk_valid or []) if not v)
-        logger.debug(
-            f"  Staging: {_si.total_staged_bytes / 1024**2:.1f}MB across {_si.num_blocks} blocks, "
-            f"corrupted_chunks={_n_corrupted}/{len(_si.chunk_valid or [])}"
-        )
+        logger.info(f"  verify_integrity: {(time.perf_counter()-_t_verify)*1000:.1f}ms")
 
     # 2b. Update config for target model
     _t_config = time.perf_counter()
@@ -448,9 +471,8 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     # 2d. Load weights: D2D from staging or full H2D
     _cached_model = _model_cache.get(target_model_name)
     if _SWITCH_DIAG: logger.debug(f'DIAG: cached={_cached_model is not None}, staging={_has_staging}')
-    if _has_staging:
-        _si = _preload_mgr.scatter_info
     if _cached_model is not None and _has_staging:
+        _si = _preload_mgr.scatter_info
         # D2D scatter-gather from KV block tails to weights region
         _t_lmap = time.perf_counter()
         layer_map = bump.get_layer_map(target_model_name)
@@ -566,8 +588,6 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
 
         # Recompute RoPE cache for new model
         _t_rope = time.perf_counter()
-        from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
-        _ROPE_DICT.clear()
         from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
         reserve_rope_cache_for_long_sequences(runner.model, runner.server_args, runner.model_config)
         bump._current_model = target_model_name
@@ -576,7 +596,9 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
 
         if _SWITCH_DIAG and h2d_src is not None:
             torch.cuda.synchronize()
-            for name, cpu_t in list(h2d_src.items())[:3]:
+            _pm_ok = 0
+            _pm_bad = []
+            for name, cpu_t in h2d_src.items():
                 parts = name.split(".")
                 obj = runner.model
                 try:
@@ -585,23 +607,29 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
                     gpu_t = obj.data
                     cpu_ref = cpu_t.to(gpu_t.dtype).to(gpu_t.device)
                     if torch.equal(gpu_t, cpu_ref):
-                        logger.info(f"  PARAM OK: {name}")
+                        _pm_ok += 1
                     else:
                         diff = (gpu_t.float() - cpu_ref.float()).abs()
-                        logger.error(f"  PARAM MISMATCH: {name} max_diff={diff.max().item():.4f} mean={diff.mean().item():.6f} nan={gpu_t.isnan().any().item()}")
+                        _pm_bad.append(f"{name}: max={diff.max().item():.4f} nan={gpu_t.isnan().any().item()}")
                 except Exception as e:
                     logger.warning(f"  PARAM CHECK SKIP: {name}: {e}")
+            logger.info(f"  D2D PARAM CHECK: {_pm_ok} OK, {len(_pm_bad)} BAD")
+            for _b in _pm_bad[:10]:
+                logger.error(f"  D2D PARAM MISMATCH: {_b}")
 
     else:
         # Full load via _load_model_bump from CPU or disk
         logger.info(f"  FALLBACK: full H2D load for {target_model_name}, cached={_cached_model is not None}, staging={_has_staging}")
         if _cpu_model is not None:
-            param_bytes = sum(p.numel() * p.element_size() for p in _cpu_model.parameters())
-            buf_bytes = sum(b.numel() * b.element_size() for b in _cpu_model.buffers()
-                           if b is not None and b.numel() > 0)
+            from sglang.srt.mem_cache.bump_vram_manager import _align_up
+            param_bytes = sum(_align_up(p.numel() * p.element_size()) for p in _cpu_model.parameters())
+            _sd_keys = set(_cpu_model.state_dict().keys())
+            buf_bytes = sum(_align_up(b.numel() * b.element_size()) for n, b in _cpu_model.named_buffers()
+                           if b is not None and b.numel() > 0 and n in _sd_keys)
             total_weight_bytes = param_bytes + buf_bytes
         elif _cpu_sd is not None:
-            total_weight_bytes = sum(v.numel() * v.element_size() for v in _cpu_sd.values())
+            from sglang.srt.mem_cache.bump_vram_manager import _align_up
+            total_weight_bytes = sum(_align_up(v.numel() * v.element_size()) for v in _cpu_sd.values())
         else:
             total_weight_bytes = 0
         bump.release_region("kv_cache")
@@ -610,14 +638,14 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         else:
             bump.allocate_region("weights", total_weight_bytes)
         runner._load_model_bump(model_name=target_model_name, staging_info=None, skip_region_alloc=True)
-
     timings["load"] = time.perf_counter() - t0
 
     # === Phase 3: KV cache rebuild ===
     t0 = time.perf_counter()
 
     _kv_cached = _kv_pool_cache.get(target_model_name)
-    if _kv_cached and _kv_cached.get("weight_bytes") == bump.regions["weights"].capacity:
+    _kv_hit = _kv_cached and _kv_cached.get("weight_bytes") == bump.regions["weights"].capacity
+    if _kv_hit:
         if "kv_cache" in bump.regions:
             bump.release_region("kv_cache")
         runner._init_runtime_region()
@@ -657,7 +685,7 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
         # Always use _init_runtime_region for correct workspace sizing
         runner._init_runtime_region()
         logger.info(f"  KV pool init: num_heads={runner.model_config.num_attention_heads}, "
-                    f"num_kv_heads={runner.model_config.get_num_kv_heads(1)}, "
+                    f"num_kv_heads={runner.model_config.get_num_kv_heads(_tp_size)}, "
                     f"head_dim={runner.model_config.head_dim}, "
                     f"num_layers={runner.model_config.num_hidden_layers}")
         runner.init_memory_pool(0)
@@ -670,17 +698,44 @@ def do_model_switch_bump(scheduler, target_model_path, target_model_name=None):
     # === Phase 4: Attention backend + CUDA graph ===
     t0 = time.perf_counter()
     runner.init_attention_backend()
-    # Update piecewise graph runner's cached attention/moe layers for new model
-    runner.init_piecewise_cuda_graphs()
 
     from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
     _forward_input_buffer_pool.clear()
 
     if not scheduler.server_args.disable_cuda_graph:
         _msa = scheduler.memory_saver_adapter if scheduler.memory_saver_adapter.enabled else None
-        if not _restore_graph_cache(runner, target_model_name, memory_saver_adapter=_msa):
+        # Skip graph restore if KV pool was rebuilt: CUDA graphs captured old KV buffer addresses
+        if _kv_hit:
+            _graph_hit = _restore_graph_cache(runner, target_model_name, memory_saver_adapter=_msa)
+        else:
+            _graph_hit = False
+            _stale_graph = _graph_cache.pop(target_model_name, None)
+            if _stale_graph:
+                if _msa and _stale_graph.get("vmm_graph_tag"):
+                    try:
+                        _msa.resume(_stale_graph["vmm_graph_tag"])
+                    except Exception as e:
+                        logger.warning(f"  VMM resume failed for stale graph: {e}")
+                logger.info(f"  Graph cache evicted: KV pool rebuilt (stale VMM released)")
+        # TP > 1: all ranks must agree on graph cache HIT/MISS (NCCL in capture)
+        if _tp_size > 1 and _tp_cpu_group is not None:
+            _hit_vote = torch.tensor([int(_graph_hit)], dtype=torch.int32)
+            torch.distributed.all_reduce(_hit_vote, op=torch.distributed.ReduceOp.MIN,
+                                          group=_tp_cpu_group)
+            _consensus_hit = bool(_hit_vote.item())
+            if not _consensus_hit and _graph_hit:
+                # Local HIT but remote MISS: invalidate local cache, recapture together
+                _graph_cache.pop(target_model_name, None)
+                _graph_hit = False
+        if not _graph_hit:
+            if _tp_size > 1 and _tp_cpu_group is not None:
+                torch.distributed.barrier(group=_tp_cpu_group)
+            runner.init_piecewise_cuda_graphs()
             _set_graph_pool(None)
             runner.init_device_graphs()
+            if _tp_size > 1 and _tp_cpu_group is not None:
+                torch.distributed.barrier(group=_tp_cpu_group)
+
 
     timings["runtime_graph"] = time.perf_counter() - t0
     logger.info(f"  runtime_graph: {timings['runtime_graph']*1000:.1f}ms")
