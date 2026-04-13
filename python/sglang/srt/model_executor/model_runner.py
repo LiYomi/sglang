@@ -464,6 +464,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable=self.server_args.enable_memory_saver
         )
 
+        # Bump allocator for model hot-switching
+        self.bump_vram_manager = None
+        if self.server_args.enable_bump_allocator:
+            from sglang.srt.mem_cache.bump_vram_manager import BumpVramAllocator
+            from sglang.srt.utils.common import get_available_gpu_memory
+            avail_gb = get_available_gpu_memory(self.device, self.gpu_id)
+            fraction = getattr(self.server_args, "mem_fraction_bump", 0.95)
+            managed_bytes = int(avail_gb * fraction * 1024**3)
+            logger.info(f"Bump: avail={avail_gb:.1f}GB, fraction={fraction}, managed={managed_bytes/1024**3:.2f}GB")
+            self.bump_vram_manager = BumpVramAllocator(managed_bytes, self.device)
+
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
 
@@ -1060,6 +1071,202 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+    def _migrate_params_to_bump(self, staging_info=None, skip_region_alloc=False):
+        """Migrate model parameters and buffers from CPU to bump buffer.
+
+        If staging_info is provided, uses D2D for staged params and H2D fallback for rest.
+        Otherwise, all params are transferred via H2D.
+        If skip_region_alloc is True, caller is responsible for region management.
+        """
+        bump = self.bump_vram_manager
+
+        # Calculate total size and allocate/reset weights region
+        # Only count persistent buffers (in state_dict). Non-persistent ones
+        # (cos_sin_cache etc.) are computed on GPU, not stored in bump.
+        # Include 256B alignment per tensor (matches bump.create_tensor layout)
+        from sglang.srt.mem_cache.bump_vram_manager import _align_up
+        param_bytes = sum(_align_up(p.numel() * p.element_size()) for p in self.model.parameters())
+        sd_keys = set(self.model.state_dict().keys())
+        persistent_buf_bytes = sum(
+            _align_up(b.numel() * b.element_size()) for n, b in self.model.named_buffers()
+            if b is not None and b.numel() > 0 and n in sd_keys
+        )
+        total_bytes = param_bytes + persistent_buf_bytes
+        logger.info(f"Bump: params={param_bytes / 1024**2:.1f} MB, "
+                    f"persistent_buffers={persistent_buf_bytes / 1024**2:.1f} MB, "
+                    f"total={total_bytes / 1024**2:.1f} MB")
+
+        if not skip_region_alloc:
+            if "weights" in bump.regions:
+                bump.reset_region("weights", total_bytes)
+            else:
+                bump.allocate_region("weights", total_bytes)
+
+        # Clear stale layer_map entries for this model to prevent accumulation
+        # (each _migrate_params_to_bump call appends; without clearing, entries double)
+        if bump._current_model and bump._current_model in bump.layer_map:
+            bump.layer_map[bump._current_model] = []
+
+        # Migrate parameters
+        d2d_stream = torch.cuda.Stream() if staging_info else None
+        h2d_stream = torch.cuda.Stream()
+        d2d_count = 0
+        h2d_count = 0
+
+        for name, p in self.model.named_parameters():
+            parts = name.split(".")
+            module = self.model
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            attr_name = parts[-1]
+            managed = bump.create_tensor("weights", p.shape, p.dtype, name=name)
+
+            _staged = staging_info.get(name) if staging_info else None
+            if _staged and _staged.status == "staged":
+                with torch.cuda.stream(d2d_stream):
+                    src = bump.buffer[_staged.staging_offset : _staged.staging_offset + _staged.nbytes]
+                    dst_bytes = managed.nelement() * managed.element_size()
+                    managed.view(-1).view(torch.uint8)[:dst_bytes].copy_(src[:dst_bytes], non_blocking=True)
+                d2d_count += 1
+            else:
+                with torch.cuda.stream(h2d_stream):
+                    managed.copy_(p.data, non_blocking=True)
+                h2d_count += 1
+                if staging_info:
+                    logger.debug(f"  H2D fallback: {name}")
+
+            new_param = torch.nn.Parameter(managed, requires_grad=False)
+            for k, v in p.__dict__.items():
+                if k not in new_param.__dict__:
+                    setattr(new_param, k, v)
+            setattr(module, attr_name, new_param)
+
+        # Migrate persistent buffers to bump (they're in state_dict, covered by staging).
+        # Non-persistent buffers (cos_sin_cache, axis_map, etc.) are computed on GPU
+        # by reserve_rope_cache_for_long_sequences, no transfer needed.
+        persistent_bufs = [(n, b) for n, b in self.model.named_buffers()
+                           if b is not None and b.numel() > 0 and n in sd_keys]
+        for buf_name, buf in persistent_bufs:
+            managed = bump.create_tensor("weights", buf.shape, buf.dtype, name=buf_name)
+            _staged = staging_info.get(buf_name) if staging_info else None
+            if _staged and _staged.status == "staged":
+                with torch.cuda.stream(d2d_stream):
+                    src = bump.buffer[_staged.staging_offset : _staged.staging_offset + _staged.nbytes]
+                    dst_bytes = managed.nelement() * managed.element_size()
+                    managed.view(-1).view(torch.uint8)[:dst_bytes].copy_(src[:dst_bytes], non_blocking=True)
+                d2d_count += 1
+            else:
+                with torch.cuda.stream(h2d_stream):
+                    managed.copy_(buf.data, non_blocking=True)
+                h2d_count += 1
+                if staging_info:
+                    logger.debug(f"  H2D fallback: {buf_name}")
+            parts = buf_name.split(".")
+            module = self.model
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            module._buffers[parts[-1]] = managed
+        if persistent_bufs:
+            logger.info(f"Bump: {len(persistent_bufs)} persistent buffers migrated")
+
+        # Synchronize
+        if d2d_stream:
+            d2d_stream.synchronize()
+        h2d_stream.synchronize()
+        logger.info(f"Bump: weights migrated (D2D: {d2d_count}, H2D: {h2d_count}), "
+                    f"used {bump.regions['weights'].used_bytes / 1024**2:.1f} MB")
+
+    def _init_runtime_region(self):
+        """Allocate bump 'runtime' region for flashinfer workspace + decode input buffers."""
+        bump = self.bump_vram_manager
+        if bump is None:
+            return
+        from sglang.srt.environ import envs
+        ws_size = (2048 * 1024 * 1024 if self.server_args.enable_deterministic_inference
+                   else envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get())
+        # Qwen2/Qwen3 models need 512MB workspace (set by FlashInfer backend init).
+        # Pre-allocate enough to avoid runtime region OOM.
+        archs = getattr(self.model_config.hf_config, 'architectures', []) or []
+        if any(a.startswith(('Qwen2', 'Qwen3', 'MiMo')) for a in archs):
+            ws_size = max(ws_size, 512 * 1024 * 1024)
+
+        # Estimate DecodeInputBuffers size (allocated into runtime region during graph capture)
+        buf_size = 0
+        if not self.server_args.disable_cuda_graph:
+            max_bs = max(self.server_args.cuda_graph_bs)
+            num_tokens_per_bs = 1
+            max_num_token = max_bs * num_tokens_per_bs
+            hidden_size = self.model_config.hidden_size
+            vocab_size = self.model_config.vocab_size
+            dtype_size = 2 if self.model_config.dtype in (torch.float16, torch.bfloat16) else 4
+            buf_size = (
+                max_num_token * 8                          # input_ids (int64)
+                + max_num_token * hidden_size * dtype_size  # input_embeds
+                + max_bs * 8                               # req_pool_indices (int64)
+                + max_bs * 4                               # seq_lens (int32)
+                + max_num_token * 8                        # out_cache_loc (int64)
+                + max_num_token * 8                        # positions (int64)
+                + 3 * max_num_token * 8                    # mrope_positions (int64)
+                + 4                                        # num_token_non_padded (int32)
+                + max_num_token * vocab_size * 4            # next_token_logits_buffer (float32)
+            )
+            buf_size = int(buf_size * 1.1)  # 10% headroom for alignment
+
+        total_size = ws_size + buf_size
+        if "runtime" in bump.regions:
+            bump.reset_region("runtime", total_size)
+        else:
+            bump.allocate_region("runtime", total_size)
+        logger.info(f"Bump: runtime reserve={total_size/1024**2:.0f}MB "
+                    f"(workspace={ws_size/1024**2:.0f}MB, buffers={buf_size/1024**2:.0f}MB)")
+
+
+    def _load_model_bump(self, model_name=None, staging_info=None, skip_region_alloc=False):
+        """Load model into bump buffer. Gets CPU model from global CpuModelCache.
+
+        First call (startup): cache.load() does disk → CPU → pin, then H2D.
+        Subsequent calls (switch): restores pinned params from cache, then D2D/H2D.
+        """
+        from sglang.srt.mem_cache.cpu_model_cache import get_cpu_model_cache
+
+        bump = self.bump_vram_manager
+        model_name = model_name or self.server_args.served_model_name
+        bump._current_model = model_name
+
+        cache = get_cpu_model_cache()
+        entry = cache.get_entry(model_name)
+
+        # First load: trigger disk → CPU → pin
+        if entry.cpu_model is None:
+            cache.load(model_name)
+
+        # Wait for loading to finish
+        cpu_model, _ = cache.get_cpu_model(model_name)
+
+        # Restore pinned CPU params (previous _migrate replaced them with GPU views)
+        for name, p in cpu_model.named_parameters():
+            if name in entry.cpu_state_dict:
+                p.data = entry.cpu_state_dict[name]
+
+        self.model = cpu_model
+        self.model.eval()
+
+        # Migrate parameters to bump (D2D for staged, H2D for the rest)
+        self._migrate_params_to_bump(staging_info=staging_info, skip_region_alloc=skip_region_alloc)
+
+        # Move non-persistent buffers (inv_freq, cos_sin_cache etc.) to GPU
+        # so reserve_rope_cache recomputes them on the correct device.
+        for name, buf in self.model.named_buffers():
+            if buf is not None and buf.device.type == "cpu":
+                parts = name.split(".")
+                module = self.model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module._buffers[parts[-1]] = buf.to(self.device)
+
+        from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
+        reserve_rope_cache_for_long_sequences(self.model, self.server_args, self.model_config)
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1137,25 +1344,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
 
-        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
-            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
-        )
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=enable_cpu_backup,
-        ):
-            self.loader = get_model_loader(
-                load_config=self.load_config,
-                model_config=self.model_config,
+        # Bump allocator path: meta-device init + managed buffer
+        if self.bump_vram_manager is not None:
+            self._init_runtime_region()  # runtime at offset 0 (fixed position)
+            self._load_model_bump()
+        else:
+            enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
+                self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
             )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
-            )
-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_transfer_engine_weight_info = (
-                    self.loader.remote_instance_transfer_engine_weight_info
+            with self.memory_saver_adapter.region(
+                GPU_MEMORY_TYPE_WEIGHTS,
+                enable_cpu_backup=enable_cpu_backup,
+            ):
+                self.loader = get_model_loader(
+                    load_config=self.load_config,
+                    model_config=self.model_config,
                 )
+                self.model = self.loader.load_model(
+                    model_config=self.model_config,
+                    device_config=DeviceConfig(self.device, self.gpu_id),
+                )
+                if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
+                    self.remote_instance_transfer_engine_weight_info = (
+                        self.loader.remote_instance_transfer_engine_weight_info
+                    )
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:

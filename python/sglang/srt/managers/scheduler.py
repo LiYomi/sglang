@@ -81,6 +81,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
+    RegisterModelReqInput,
     AbortReq,
     ActiveRanksOutput,
     AttachHiCacheStorageReqInput,
@@ -380,6 +381,9 @@ class Scheduler(
         # Init mamba backend
         self.init_mamba_backend()
 
+        # Init CPU model cache before model worker (model_runner._load_model_bump needs it)
+        self.init_cpu_model_cache()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -388,6 +392,9 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
+
+        # Init KV transfer for multi-model hot-switching
+        self.init_kv_transfer()
 
         # Init running status
         self.init_running_status()
@@ -435,6 +442,7 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.active_model_name = self.server_args.served_model_name or self.server_args.model_path
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
@@ -696,6 +704,29 @@ class Scheduler(
             self.metrics_collector.emit_cache_config_info(
                 self.page_size, self.max_total_num_tokens // self.page_size
             )
+
+    def init_cpu_model_cache(self):
+        """Initialize global CPU model cache for multi-model hot-switching."""
+        if self.server_args.enable_bump_allocator:
+            from sglang.srt.mem_cache.cpu_model_cache import get_cpu_model_cache
+            self._cpu_model_cache = get_cpu_model_cache()
+            model_name = self.server_args.served_model_name or self.server_args.model_path
+            self._cpu_model_cache.register(model_name, self.server_args.model_path)
+        else:
+            self._cpu_model_cache = None
+
+    def init_kv_transfer(self):
+        """Initialize KV transfer for continuous D2H backup during hot-switching."""
+        if self.server_args.enable_bump_allocator:
+            from sglang.srt.mem_cache.kv_transfer import KVTransfer
+            self._kv_transfer = KVTransfer()
+        else:
+            self._kv_transfer = None
+        self._preload_thread = None
+        self._preload_manager = None
+        self._preload_attempted_target = None  # dedup: prevent re-triggering for same target
+        self._pending_switch = None
+        self._prev_model_name = None
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
@@ -1225,6 +1256,7 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (RegisterModelReqInput, self.register_model),
             ]
         )
 
@@ -1281,6 +1313,9 @@ class Scheduler(
                 self.cancel_bubble_timer()
                 continue
 
+            # Execute deferred model switch before scheduling new batches
+            self._execute_pending_switch()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1292,6 +1327,8 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
+            # Check if a model needs preloading (non-blocking, runs in background thread)
+            self._check_preload()
 
             # Update last_batch
             self.last_batch = batch
@@ -1318,6 +1355,8 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
+            # Execute deferred model switch before scheduling new batches
+            self._execute_pending_switch()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
@@ -1342,6 +1381,8 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+            # Check if a model needs preloading (non-blocking, runs in background thread)
+            self._check_preload()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1712,6 +1753,12 @@ class Scheduler(
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
+            # Multi-model: trigger switch if request targets a different model
+            target = getattr(recv_req, "model_name", None)
+            open("/tmp/switch_diag.log","a").write(f"SCHED: target={target}, active={self.active_model_name}\n")
+            if target and target != self.active_model_name:
+                self._prepare_model_switch(target)
 
             req = Req(
                 recv_req.rid,
@@ -2143,6 +2190,9 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # If a model switch is pending, do not schedule new batches
+        if self._pending_switch is not None:
+            return None
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:

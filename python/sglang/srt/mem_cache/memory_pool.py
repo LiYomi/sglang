@@ -755,7 +755,9 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        bump_vram_manager=None,
     ):
+        self.bump_vram_manager = bump_vram_manager
         super().__init__(
             size,
             page_size,
@@ -840,30 +842,56 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+        bump = getattr(self, "bump_vram_manager", None)
+        if bump is not None:
+            # Allocate KV cache from bump buffer
+            k_shape = (self.size + self.page_size, self.head_num, self.head_dim)
+            v_shape = (self.size + self.page_size, self.head_num, self.v_head_dim)
+            # Allocate kv_cache region if not already done
+            total_kv_bytes = 0
+            elem_size = torch.tensor([], dtype=self.store_dtype).element_size()
+            from math import prod
+            total_kv_bytes += prod(k_shape) * elem_size * self.layer_num
+            total_kv_bytes += prod(v_shape) * elem_size * self.layer_num
+            if "kv_cache" not in bump.regions:
+                bump.allocate_region("kv_cache", total_kv_bytes)
+            else:
+                bump.reset_region("kv_cache", total_kv_bytes)
+            self.k_buffer = []
+            self.v_buffer = []
+            for _ in range(self.layer_num):
+                k = bump.create_tensor("kv_cache", k_shape, self.store_dtype)
+                k.zero_()
+                self.k_buffer.append(k)
+            for _ in range(self.layer_num):
+                v = bump.create_tensor("kv_cache", v_shape, self.store_dtype)
+                v.zero_()
+                self.v_buffer.append(v)
+        else:
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.v_head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -945,21 +973,22 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
-        torch.cuda.synchronize()
+        h2d_stream = torch.cuda.Stream()
         chunk_size = self.cpu_offloading_chunk_size
-        for layer_id in range(self.layer_num):
-            for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
-                k_cpu, v_cpu = (
-                    kv_cache_cpu[layer_id][i // chunk_size][0],
-                    kv_cache_cpu[layer_id][i // chunk_size][1],
-                )
-                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
-                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
-                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
-                self.k_buffer[layer_id][chunk_indices] = k_chunk
-                self.v_buffer[layer_id][chunk_indices] = v_chunk
-        torch.cuda.synchronize()
+        with torch.cuda.stream(h2d_stream):
+            for layer_id in range(self.layer_num):
+                for i in range(0, len(indices), chunk_size):
+                    chunk_indices = indices[i : i + chunk_size]
+                    k_cpu, v_cpu = (
+                        kv_cache_cpu[layer_id][i // chunk_size][0],
+                        kv_cache_cpu[layer_id][i // chunk_size][1],
+                    )
+                    k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
+                    v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
+                    self.k_buffer[layer_id][chunk_indices] = k_chunk
+                    self.v_buffer[layer_id][chunk_indices] = v_chunk
+        h2d_stream.synchronize()
+
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing

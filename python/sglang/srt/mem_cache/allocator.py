@@ -109,7 +109,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def alloc(self, need_size: int):
         raise NotImplementedError()
 
-    @abc.abstractmethod
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
 
@@ -124,8 +123,13 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        lifo_mode: bool = False,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        self._lifo_mode = lifo_mode
+        self._staging_lock = None  # set during preload for thread-safe free_pages access
+        self._preload_mgr = None   # set during preload for chunk dirty tracking (Issue M)
+        self._reserved_range = None  # (start, end) during preload -- CPU-side staging reservation
         self.clear()
 
     def clear(self):
@@ -142,27 +146,43 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return len(self.free_pages) + len(self.release_pages)
 
     def alloc(self, need_size: int):
-        if self.need_sort and need_size > len(self.free_pages):
-            self.merge_and_sort_free()
+        _lk = self._staging_lock
+        if _lk: _lk.acquire()
+        try:
+            if self.need_sort and need_size > len(self.free_pages):
+                self.merge_and_sort_free()
 
-        if need_size > len(self.free_pages):
-            return None
+            if need_size > len(self.free_pages):
+                return None
 
-        select_index = self.free_pages[:need_size]
-        self.free_pages = self.free_pages[need_size:]
-        return select_index
+            select_index = self.free_pages[:need_size]
+            self.free_pages = self.free_pages[need_size:]
+            # Notify staging of potential corruption (Issue M)
+            if self._preload_mgr is not None:
+                self._preload_mgr.mark_dirty_pages(select_index)
+            return select_index
+        finally:
+            if _lk: _lk.release()
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
-            if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
+        _lk = self._staging_lock
+        if _lk: _lk.acquire()
+        try:
+            if self.is_not_in_free_group:
+                if self.need_sort:
+                    self.release_pages = torch.cat((self.release_pages, free_index))
+                elif self._lifo_mode:
+                    # LIFO: prepend freed slots so they are reused first.
+                    self.free_pages = torch.cat((free_index, self.free_pages))
+                else:
+                    self.free_pages = torch.cat((self.free_pages, free_index))
             else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
-        else:
-            self.free_group.append(free_index)
+                self.free_group.append(free_index)
+        finally:
+            if _lk: _lk.release()
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

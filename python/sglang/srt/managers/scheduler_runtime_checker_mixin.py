@@ -375,6 +375,12 @@ class SchedulerRuntimeCheckerMixin:
             if self.hisparse_coordinator.has_ongoing_staging():
                 return
 
+        # Skip memory check while preload is in progress (staging temporarily
+        # removes chunk rows from allocator, causing false leak detection)
+        _pt = getattr(self, "_preload_thread", None)
+        if _pt is not None and _pt.is_alive():
+            return
+
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio

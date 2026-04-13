@@ -449,6 +449,24 @@ class SchedulerOutputProcessorMixin:
             ):
                 self.decode_offload_manager.offload_kv_cache(req)
 
+            # Decode step D2H: incrementally offload KV to CPU each decode step
+            _kv_offload = self._kv_transfer
+            if (
+                _kv_offload is not None
+                and not req.finished()
+                and self.server_args.enable_bump_allocator
+                and req.req_pool_idx is not None
+            ):
+                _runner = self.tp_worker.model_runner
+                _kv_offload.offload_incremental(
+                    req_pool_idx=req.req_pool_idx,
+                    kv_committed_len=req.kv_committed_len,
+                    model_name=self.active_model_name,
+                    kv_pool=_runner.token_to_kv_pool,
+                    num_layers=_runner.num_effective_layers,
+                    req_to_token_pool=self.tree_cache.req_to_token_pool,
+                )
+
             if req.finished():
                 # delete feature to save memory
                 if req.multimodal_inputs is not None and req.session is None:
@@ -460,9 +478,50 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
+                    # Finalize incremental D2H (merge chunks) or fallback to batch offload
+                    _kv_offload = self._kv_transfer
+                    if _kv_offload is not None and req.req_pool_idx is not None:
+                        _kv_committed = req.kv_committed_len
+                        _model_name = self.active_model_name
+                        _token_ids = (req.origin_input_ids + req.output_ids)
+                        if req.req_pool_idx in _kv_offload._incremental:
+                            # Incremental D2H was active: finalize last chunk + merge
+                            _runner = self.tp_worker.model_runner
+                            _kv_offload.offload_incremental(
+                                req_pool_idx=req.req_pool_idx,
+                                kv_committed_len=_kv_committed,
+                                model_name=_model_name,
+                                kv_pool=_runner.token_to_kv_pool,
+                                num_layers=_runner.num_effective_layers,
+                                req_to_token_pool=self.tree_cache.req_to_token_pool,
+                            )
+                            _kv_offload.finalize_incremental(
+                                req_pool_idx=req.req_pool_idx,
+                                model_name=_model_name,
+                                token_ids=_token_ids,
+                                num_layers=_runner.num_effective_layers,
+                            )
+                        elif _kv_committed > 0:
+                            # Fallback: batch offload (no incremental was active)
+                            _input_len = len(req.origin_input_ids)
+                            _slot_indices = self.tree_cache.req_to_token_pool.req_to_token[
+                                req.req_pool_idx, :min(_input_len, _kv_committed)
+                            ]
+                            _runner = self.tp_worker.model_runner
+                            _kv_offload.offload(
+                                model_name=_model_name,
+                                token_ids=_token_ids[:min(_input_len, _kv_committed)],
+                                slot_indices=_slot_indices,
+                                kv_pool=_runner.token_to_kv_pool,
+                                num_layers=_runner.num_effective_layers,
+                            )
                     if self.enable_hisparse:
                         self.hisparse_coordinator.request_finished(req)
-                    release_kv_cache(req, self.tree_cache)
+                    # Bump mode: always skip radix tree insert (eager slot reclaim).
+                    # KV data is already backed up to CPU via decode step D2H.
+                    # Slots go to LIFO front, keeping allocation compact on the left.
+                    _bump_mode = self.server_args.enable_bump_allocator
+                    release_kv_cache(req, self.tree_cache, is_insert=not _bump_mode)
 
                 req.time_stats.set_completion_time()
 
@@ -1166,6 +1225,7 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    model_name=self.active_model_name,
                 )
             )
 
