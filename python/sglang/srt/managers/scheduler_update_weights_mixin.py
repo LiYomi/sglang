@@ -387,11 +387,11 @@ class SchedulerUpdateWeightsMixin:
                     max_runtime_bytes=_max_runtime_bytes,
                     bump_total_bytes=_bump_total_bytes,
                 )
-                logger.info(f"  TIMING: start_preload_total={(_time_pl.perf_counter()-_t_preload)*1000:.0f}ms")
+                logger.debug(f"  TIMING: start_preload_total={(_time_pl.perf_counter()-_t_preload)*1000:.0f}ms")
             except Exception as e:
                 logger.error(f"Preload thread error: {e}", exc_info=True)
             finally:
-                logger.info(f"Preload thread exiting for {target_model_name}, is_valid={preload_mgr.is_valid}")
+                logger.debug(f"Preload thread exiting for {target_model_name}, is_valid={preload_mgr.is_valid}")
                 # Remove lock after preload completes — no contention outside preload
                 _allocator._staging_lock = None
                 # Keep _preload_mgr alive — dirty flags needed until switch consumes them

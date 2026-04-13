@@ -33,6 +33,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Pre-load C++ batch H2D extension (compiled once, imported instantly after)
+_batch_h2d_module = None
+def _get_batch_h2d():
+    global _batch_h2d_module
+    if _batch_h2d_module is None:
+        try:
+            import importlib.util
+            _so = "/home/mxc/.cache/torch_extensions/py312_cu128/batch_h2d/batch_h2d.so"
+            spec = importlib.util.spec_from_file_location("batch_h2d", _so)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _batch_h2d_module = mod
+        except Exception:
+            from torch.utils.cpp_extension import load as _cpp_load
+            _batch_h2d_module = _cpp_load(
+                name="batch_h2d",
+                sources=["/home/mxc/sglang-feat-hot-switch/python/sglang/srt/mem_cache/csrc/batch_h2d.cpp"],
+                extra_include_paths=["/usr/local/cuda-12.8/targets/x86_64-linux/include"],
+                extra_ldflags=["-lcudart", "-L/usr/local/cuda-12.8/lib64"],
+                verbose=False,
+            )
+    return _batch_h2d_module
+
 H2D_CHUNK_SIZE = 32 * 1024 * 1024  # 32MB per block per round
 
 
@@ -149,15 +172,17 @@ class PreloadManager:
         self.layer_map = _layer_map
 
         # --- H2D scatter directly from pinned CPU params (no intermediate buffer) ---
-        _t_h2d = _time.perf_counter()
         chunk_rows = max(1, H2D_CHUNK_SIZE // row_size)
+        self._allocator_ref = allocator
         total_written = self._h2d_scatter(
             safe_blocks, cpu_state_dict, _layer_map, _weights_start,
             num_blocks, pool_size, row_size,
             staging_start, staged_per_block, chunk_rows,
-            allocator, alloc_lock,
         )
-        logger.info(f"  TIMING: h2d_scatter={(_time.perf_counter()-_t_h2d)*1000:.0f}ms written={total_written/1024**2:.0f}MB")
+        self._allocator_ref = None
+        _scatter_ms = getattr(self, "_last_scatter_ms", 0)
+        logger.debug(f"  TIMING: h2d_scatter={_scatter_ms:.0f}ms written={total_written/1024**2:.0f}MB")
+
         self.scatter_info = ScatterStagingInfo(
             staging_start=staging_start,
             staging_rows=staging_rows,
@@ -183,7 +208,7 @@ class PreloadManager:
         self._staging_end = staging_start + staging_rows
         self._chunk_rows = chunk_rows
 
-        logger.info(
+        logger.debug(
             f"Preload: {model_name}, "
             f"{total_written / 1024**2:.1f}MB staged across {num_blocks} blocks, "
             f"rows [{staging_start}, {pool_size}), "
@@ -355,21 +380,24 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
         self, blocks, cpu_state_dict, layer_map, weights_start,
         num_blocks, pool_size, row_size,
         staging_start, staged_per_block, chunk_rows,
-        allocator, alloc_lock,
     ):
-        """Direct H2D from pinned CPU params to GPU block tails. No intermediate buffer.
+        """Direct H2D via C++ batch dispatch. GIL-free per-chunk copies.
 
-        Uses layer_map to map each param to the correct block and position.
-        Block bi holds weight layout bytes [bi*spb, (bi+1)*spb).
-        Chunk-based row locking preserved for KV allocator safety.
+        All data_ptr() calls happen once in plan phase. Per-chunk loop
+        only passes integer lists to C++ — zero Python tensor ops.
         """
         import time as _time_h2d
         import torch
+        _batch_h2d = _get_batch_h2d()
+        stream_ptr = self.h2d_stream.cuda_stream
+        stream_ptr = self.h2d_stream.cuda_stream
 
-        # --- Pre-compute per-block param copy plan ---
+        # === Plan phase: pre-compute ALL ops with data_ptr (one-time GIL cost) ===
         _t_plan = _time_h2d.perf_counter()
-        block_params = [[] for _ in range(num_blocks)]
+        staging_rows = math.ceil(staged_per_block / row_size)
 
+        # Step 1: build per-block param list with raw byte views
+        block_params = [[] for _ in range(num_blocks)]
         if layer_map:
             for ls in layer_map:
                 t = cpu_state_dict.get(ls.name)
@@ -384,9 +412,8 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
                 last_bi = (rel + raw - 1) // staged_per_block
                 for bi in range(max(0, first_bi), min(last_bi + 1, num_blocks)):
                     blk_start = bi * staged_per_block
-                    blk_end = blk_start + staged_per_block
                     cs = max(rel, blk_start)
-                    ce = min(rel + raw, blk_end)
+                    ce = min(rel + raw, blk_start + staged_per_block)
                     if ce <= cs:
                         continue
                     block_params[bi].append((cs - blk_start, cpu_view[cs - rel : ce - rel]))
@@ -403,104 +430,98 @@ kv_pool_physical_start: physical start of KV pool in bump buffer
                 last_bi = (pos + raw - 1) // staged_per_block
                 for bi in range(max(0, first_bi), min(last_bi + 1, num_blocks)):
                     blk_start = bi * staged_per_block
-                    blk_end = blk_start + staged_per_block
                     cs = max(pos, blk_start)
-                    ce = min(pos + raw, blk_end)
+                    ce = min(pos + raw, blk_start + staged_per_block)
                     if ce <= cs:
                         continue
                     block_params[bi].append((cs - blk_start, cpu_view[cs - pos : ce - pos]))
                 pos += aligned
 
-        _plan_ms = (_time_h2d.perf_counter() - _t_plan) * 1000
-        _total_ops = sum(len(bp) for bp in block_params)
-        # One-shot pinned check
-        _pinned_count = 0
-        _unpinned_count = 0
-        _total_check = 0
-        for _bp in block_params[:3]:  # check first 3 blocks
-            for (_off, _src) in _bp:
-                _total_check += 1
-                if _src.is_pinned():
-                    _pinned_count += 1
-                else:
-                    _unpinned_count += 1
-        logger.info(f"    PINNED CHECK: {_pinned_count} pinned, {_unpinned_count} unpinned out of {_total_check} checked")
-        logger.info(f"    H2D plan: {_plan_ms:.0f}ms, {_total_ops} copy ops across {num_blocks} blocks")
+        # Step 2: pre-compute data_ptr for ALL ops, grouped by chunk
+        # chunk_ops[chunk_idx] = [(src_ptr, dst_ptr, nbytes), ...]
+        block_flats = [blk.view(-1).view(torch.uint8) for blk in blocks]
 
-        # --- Pipelined H2D with chunk-based locking ---
-        staging_rows = math.ceil(staged_per_block / row_size)
-        chunk_end = staging_start + staging_rows - 1
+        chunk_ops_list = []
+        chunk_row_ranges = []  # (chunk_start_row, chunk_end_row) for reservation release
         written_per_block = 0
-        total_written = 0
-        pending_unlocks: List[tuple] = []
+        chunk_end = staging_start + staging_rows - 1
 
         while chunk_end >= staging_start and written_per_block < staged_per_block:
             actual_rows = min(chunk_rows, chunk_end - staging_start + 1)
-            chunk_start = chunk_end - actual_rows + 1
+            chunk_start_row = chunk_end - actual_rows + 1
             chunk_bytes = min(actual_rows * row_size, staged_per_block - written_per_block)
             if chunk_bytes <= 0:
                 break
 
-            self._drain_completed_unlocks(pending_unlocks, allocator, alloc_lock)
-
-            locked = None
-            if allocator is not None:
-                _lk = alloc_lock
-                if _lk: _lk.acquire()
-                try:
-                    fp = allocator.free_pages
-                    mask = (fp >= chunk_start) & (fp <= chunk_end)
-                    locked = fp[mask]
-                    if locked.numel() < actual_rows:
-                        logger.info(
-                            f"Preload: early exit -- only {locked.numel()}/{actual_rows} "
-                            f"rows free in [{chunk_start}, {chunk_end}]"
-                        )
-                        locked = None
-                        break
-                    allocator.free_pages = fp[~mask]
-                finally:
-                    if _lk: _lk.release()
-
             tail_off = staged_per_block - written_per_block - chunk_bytes
+            ops = []
             chunk_written = 0
-            _n_copies = 0
-            _t_chunk = _time_h2d.perf_counter()
 
-            with torch.cuda.stream(self.h2d_stream):
-                for bi in range(num_blocks):
-                    flat = blocks[bi].view(-1).view(torch.uint8)
-                    dst_base = chunk_start * row_size
-                    for (off_in_blk, src_bytes) in block_params[bi]:
-                        param_end = off_in_blk + len(src_bytes)
-                        if param_end <= tail_off or off_in_blk >= tail_off + chunk_bytes:
-                            continue
-                        cs = max(off_in_blk, tail_off)
-                        ce = min(param_end, tail_off + chunk_bytes)
-                        n = ce - cs
-                        src_s = cs - off_in_blk
-                        dst_s = dst_base + (cs - tail_off)
-                        flat[dst_s : dst_s + n].copy_(
-                            src_bytes[src_s : src_s + n], non_blocking=True
-                        )
-                        chunk_written += n
-                        _n_copies += 1
+            for bi in range(num_blocks):
+                dst_base = chunk_start_row * row_size
+                for (off_in_blk, src_bytes) in block_params[bi]:
+                    param_end = off_in_blk + len(src_bytes)
+                    if param_end <= tail_off or off_in_blk >= tail_off + chunk_bytes:
+                        continue
+                    cs = max(off_in_blk, tail_off)
+                    ce = min(param_end, tail_off + chunk_bytes)
+                    n = ce - cs
+                    src_s = cs - off_in_blk
+                    dst_s = dst_base + (cs - tail_off)
+                    ops.append((
+                        src_bytes[src_s : src_s + n].data_ptr(),
+                        block_flats[bi][dst_s : dst_s + n].data_ptr(),
+                        n,
+                    ))
+                    chunk_written += n
+
+            chunk_ops_list.append((ops, chunk_written))
+            chunk_row_ranges.append(chunk_start_row)
+            written_per_block += chunk_bytes
+            chunk_end = chunk_start_row - 1
+
+        _plan_ms = (_time_h2d.perf_counter() - _t_plan) * 1000
+        _total_ops = sum(len(ops) for ops, _ in chunk_ops_list)
+        logger.debug(f"    H2D plan: {_plan_ms:.0f}ms, {_total_ops} ops, {len(chunk_ops_list)} chunks")
+
+        # === Dispatch phase: per-chunk C++ call + event sync + progressive release ===
+        _t_dispatch = _time_h2d.perf_counter()
+        total_written = 0
+        staging_end = staging_start + staging_rows
+        allocator_ref = getattr(self, '_allocator_ref', None)
+
+        for ci, ((ops, chunk_written), chunk_start_row) in enumerate(
+            zip(chunk_ops_list, chunk_row_ranges)
+        ):
+            # Per-chunk reservation: only reserve rows being H2D'd right now (~6%)
+            if allocator_ref is not None:
+                chunk_end_row = min(chunk_start_row + chunk_rows, staging_start + staging_rows)
+                allocator_ref._reserved_range = (chunk_start_row, chunk_end_row)
+
+            if ops:
+                _batch_h2d.dispatch(ops, stream_ptr)
 
             event = torch.cuda.Event()
             event.record(self.h2d_stream)
-            if allocator is not None and locked is not None and locked.numel() > 0:
-                pending_unlocks.append((event, locked))
+            event.synchronize()
+
+            # Chunk done: clear reservation (data written, LIFO protects it)
+            if allocator_ref is not None:
+                allocator_ref._reserved_range = None
+
+            # Progressive release
+            if allocator_ref is not None:
+                new_end = chunk_start_row
+                if new_end <= staging_start:
+                    allocator_ref._reserved_range = None
+                else:
+                    allocator_ref._reserved_range = (staging_start, new_end)
 
             total_written += chunk_written
-            _chunk_ms = (_time_h2d.perf_counter() - _t_chunk) * 1000
-            if _chunk_ms > 100:
-                logger.info(f"      chunk: {_chunk_ms:.0f}ms {_n_copies} copies {chunk_written/1024**2:.0f}MB tail_off={tail_off}")
-            written_per_block += chunk_bytes
-            chunk_end = chunk_start - 1
 
-        _total_chunks = math.ceil(staged_per_block / (chunk_rows * row_size)) if chunk_rows > 0 else 0
-        logger.info(f"    H2D scatter done: {total_written/1024**2:.0f}MB in {_total_chunks} chunks")
-        self._drain_all_unlocks(pending_unlocks, allocator, alloc_lock)
+        _dispatch_ms = (_time_h2d.perf_counter() - _t_dispatch) * 1000
+        logger.debug(f"    H2D dispatch+sync: {_dispatch_ms:.0f}ms")
+        self._last_scatter_ms = (_time_h2d.perf_counter() - _t_plan) * 1000
         return total_written
 
     @staticmethod

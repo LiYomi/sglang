@@ -107,9 +107,53 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     @abc.abstractmethod
     def alloc(self, need_size: int):
-        raise NotImplementedError()
+        _lk = self._staging_lock
+        if _lk: _lk.acquire()
+        try:
+            if self.need_sort and need_size > len(self.free_pages):
+                self.merge_and_sort_free()
 
-    @abc.abstractmethod
+            if need_size > len(self.free_pages):
+                return None
+
+            # CPU-side staging reservation: skip reserved pages if possible
+            if self._reserved_range is not None:
+                n_reserved = self._reserved_range[1] - self._reserved_range[0]
+                remaining_after = len(self.free_pages) - need_size
+                if remaining_after <= n_reserved:
+                    return self._alloc_with_reservation_check(need_size)
+
+            select_index = self.free_pages[:need_size]
+            self.free_pages = self.free_pages[need_size:]
+            # Notify staging of potential corruption (Issue M)
+            if self._preload_mgr is not None:
+                self._preload_mgr.mark_dirty_pages(select_index)
+            return select_index
+        finally:
+            if _lk: _lk.release()
+
+    def _alloc_with_reservation_check(self, need_size):
+        """Fallback: filter out reserved staging pages. Only called when free pages are low."""
+        import torch
+        start, end = self._reserved_range
+        mask = (self.free_pages < start) | (self.free_pages >= end)
+        non_reserved = self.free_pages[mask]
+
+        if need_size <= len(non_reserved):
+            select_index = non_reserved[:need_size]
+            reserved = self.free_pages[~mask]
+            self.free_pages = torch.cat([non_reserved[need_size:], reserved])
+        else:
+            # Must use reserved pages -- wait for H2D to finish first
+            if self._preload_mgr is not None:
+                torch.cuda.current_stream().wait_stream(self._preload_mgr.h2d_stream)
+            select_index = self.free_pages[:need_size]
+            self.free_pages = self.free_pages[need_size:]
+
+        if self._preload_mgr is not None:
+            self._preload_mgr.mark_dirty_pages(select_index)
+        return select_index
+
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
 
@@ -130,6 +174,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._lifo_mode = lifo_mode
         self._staging_lock = None  # set during preload for thread-safe free_pages access
         self._preload_mgr = None   # set during preload for chunk dirty tracking (Issue M)
+        self._reserved_range = None  # (start, end) during preload -- CPU-side staging reservation
         self.clear()
 
     def clear(self):
