@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 import os
+import threading
 import signal
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
@@ -31,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
+    ModelTokenizerReadyNotification,
+    RegisterModelNotification,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -58,6 +61,20 @@ logger = logging.getLogger(__name__)
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
 
+class _TokenizerLoadFailedSentinel:
+    """Marker stored in model_tokenizers when background load fails.
+
+    Lets the main thread distinguish "never registered" (missing key) from
+    "registered but failed" (sentinel) so it raises a clear error instead of
+    silently falling back to the default tokenizer.
+    """
+
+    __slots__ = ()
+
+
+_TOKENIZER_LOAD_FAILED = _TokenizerLoadFailedSentinel()
+
+
 @dataclasses.dataclass
 class DecodeStatus:
     """Store the status of incremental decoding."""
@@ -78,6 +95,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        self.server_args = server_args
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -98,8 +116,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.send_to_tokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
+        # Captured so background _preload_tokenizer threads can connect their
+        # own short-lived PUSH socket (ZMQ sockets are not thread-safe, so we
+        # can't reuse send_to_tokenizer from a worker thread).
+        self._zmq_context = context
+        self._tokenizer_ipc_addr = port_args.tokenizer_ipc_name
 
     def init_tokenizer(self, server_args: ServerArgs):
+        self.model_tokenizers = {}  # model_name -> tokenizer
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -109,6 +133,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
+            model_name = server_args.served_model_name or server_args.model_path
+            self.model_tokenizers[model_name] = self.tokenizer
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
@@ -139,10 +165,71 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+            if isinstance(recv_obj, RegisterModelNotification):
+                self._preload_tokenizer(recv_obj.model_name, recv_obj.model_path)
+                self.soft_watchdog.feed()
+                continue
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
             self.soft_watchdog.feed()
+
+    def _preload_tokenizer(self, model_name: str, model_path: str):
+        """Pre-load tokenizer in background thread (non-blocking).
+
+        On completion (success or failure) sends ModelTokenizerReadyNotification
+        to tokenizer_manager so it can flip the per-model readiness flag used
+        by the request gate. Failure writes a sentinel into model_tokenizers so
+        any stray request for that model fails loud instead of fallback-decoding
+        with the default tokenizer.
+        """
+        if model_name in self.model_tokenizers:
+            # Already cached (success sentinel). Re-ACK in case the previous
+            # ready notification was lost.
+            self._ack_tokenizer_ready(model_name, None)
+            return
+
+        def _load():
+            error: Optional[BaseException] = None
+            try:
+                tok = get_tokenizer(
+                    model_path,
+                    tokenizer_mode=self.server_args.tokenizer_mode,
+                    trust_remote_code=self.server_args.trust_remote_code,
+                )
+                self.model_tokenizers[model_name] = tok
+                logger.info(f"Detokenizer pre-cached tokenizer: {model_name}")
+            except Exception as e:
+                logger.exception(f"Failed to pre-cache tokenizer {model_name}")
+                self.model_tokenizers[model_name] = _TOKENIZER_LOAD_FAILED
+                error = e
+            self._ack_tokenizer_ready(model_name, error)
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _ack_tokenizer_ready(self, model_name: str, error: Optional[BaseException]):
+        """Send ModelTokenizerReadyNotification to tokenizer_manager.
+
+        Safe to call from a worker thread: creates a short-lived PUSH socket
+        bound to its own thread instead of reusing self.send_to_tokenizer.
+        """
+        try:
+            sock = self._zmq_context.socket(zmq.PUSH)
+            try:
+                sock.connect(self._tokenizer_ipc_addr)
+                sock.send_pyobj(
+                    ModelTokenizerReadyNotification(
+                        model_name=model_name,
+                        success=error is None,
+                        error=str(error) if error is not None else "",
+                    )
+                )
+            finally:
+                sock.close(linger=1000)
+        except Exception:
+            logger.exception(
+                f"Failed to ACK tokenizer readiness for {model_name}"
+            )
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -319,6 +406,25 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_strs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        # Multi-model: select tokenizer by model_name. tokenizer_manager gates
+        # requests on readiness, so by the time we see output here the entry
+        # should exist and be a real tokenizer. Bail out loud if not — better
+        # than silently decoding with the wrong vocab.
+        _name = recv_obj.model_name
+        if _name:
+            tok = self.model_tokenizers.get(_name)
+            if tok is None:
+                raise RuntimeError(
+                    f"Detokenizer has no tokenizer for model '{_name}'. "
+                    f"Request should have been rejected at the tokenizer_manager gate."
+                )
+            if isinstance(tok, _TokenizerLoadFailedSentinel):
+                raise RuntimeError(
+                    f"Tokenizer load failed for model '{_name}'; "
+                    f"cannot decode output."
+                )
+            self.tokenizer = tok
+
         # If handling idle batch, set output_strs to [].
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)

@@ -140,6 +140,22 @@ class ModelRunnerKVCacheMixin:
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
+        # Bump allocator: compute from managed buffer remaining space
+        if self.vram_mgr is not None:
+            bump = self.vram_mgr
+            cell_size = self.get_cell_size_per_token(self.num_effective_layers)
+            # `get_available_bytes()` already excludes the runtime region,
+            # which was allocated earlier in `_init_runtime_region()` (see
+            # `load_model` and `_kv_rebuild`). Subtracting ws_size+buf_size
+            # here would double-count it and under-report KV capacity.
+            available_bytes = bump.get_available_bytes()
+            max_tokens = available_bytes // cell_size
+            logger.info(
+                f"Bump: KV cache available={available_bytes/1024**2:.1f}MB, "
+                f"cell_size={cell_size}, max_tokens={max_tokens}"
+            )
+            return max_tokens
+
         post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -705,6 +721,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        vram_mgr=self.vram_mgr,
                     )
 
         # Initialize token_to_kv_pool_allocator
@@ -773,6 +790,7 @@ class ModelRunnerKVCacheMixin:
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            lifo_mode=self.server_args.enable_bump_allocator,
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(

@@ -318,6 +318,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            model_name=request.model,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
@@ -371,6 +372,29 @@ class OpenAIServingChat(OpenAIServingBase):
 
         result.tool_call_constraint = tool_call_constraint
         return result
+
+    def _select_chat_tokenizer(self, request: ChatCompletionRequest):
+        """Pick the tokenizer for chat-template rendering.
+
+        Raises ValueError if `request.model` names an unregistered model or
+        one whose tokenizer has no chat_template — silent fallback to the
+        default tokenizer would format the prompt with the wrong template.
+        """
+        if not request.model:
+            return self.tokenizer_manager.tokenizer
+        target = self.tokenizer_manager.model_tokenizers.get(request.model)
+        if target is None:
+            # Request reaches here only after the tokenize gate, so this
+            # should be unreachable in practice. Defend anyway.
+            raise ValueError(
+                f"Model '{request.model}' is not registered with a tokenizer"
+            )
+        if not getattr(target, "chat_template", None):
+            raise ValueError(
+                f"Model '{request.model}' has no chat_template; cannot use "
+                f"the chat completions endpoint"
+            )
+        return target
 
     def _apply_jinja_template(
         self,
@@ -477,8 +501,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            chat_tokenizer = self._select_chat_tokenizer(request)
+
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                prompt_ids = chat_tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
@@ -495,7 +521,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    prompt_ids = chat_tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
                         add_generation_prompt=True,

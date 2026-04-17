@@ -63,7 +63,9 @@ from sglang.srt.managers.io_struct import (
     ProfileReqOutput,
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
+    RegisterModelReqInput,
     ReleaseMemoryOccupationReqOutput,
+    RegisterModelReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -193,6 +195,9 @@ class TokenizerCommunicatorMixin:
         self.release_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.register_model_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -279,6 +284,10 @@ class TokenizerCommunicatorMixin:
                 (
                     ReleaseMemoryOccupationReqOutput,
                     self.release_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    RegisterModelReqOutput,
+                    self.register_model_communicator.handle_recv,
                 ),
                 (
                     ResumeMemoryOccupationReqOutput,
@@ -966,3 +975,26 @@ class TokenizerCommunicatorMixin:
         """Update weight version if provided."""
         if weight_version is not None:
             self.server_args.weight_version = weight_version
+
+    async def register_model(
+        self: TokenizerManager,
+        obj: RegisterModelReqInput,
+        request=None,
+    ):
+        """Register a model: load tokenizer locally + notify scheduler."""
+        self.auto_create_handle_loop()
+        # 1. Kick off background local tokenizer load + mark pending.
+        local_result = self.register_model_local(obj.model_name, obj.model_path)
+        if not local_result.success:
+            return local_result
+        # 2. Notify scheduler to register the model path mapping.
+        result = await self.register_model_communicator(obj)
+        # 3. Rollback local registration if scheduler rejected (e.g. conflict).
+        if not getattr(result, "success", True):
+            self.model_tokenizers.pop(obj.model_name, None)
+            self._model_readiness.pop(obj.model_name, None)
+            logger.warning(
+                f"register_model rollback: scheduler rejected '{obj.model_name}' "
+                f"— local tokenizer registration undone"
+            )
+        return result

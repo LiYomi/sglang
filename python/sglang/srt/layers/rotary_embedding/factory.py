@@ -59,6 +59,11 @@ if _use_aiter:
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
+def clear_rope_cache() -> None:
+    """Drop every cached RotaryEmbedding. Used when switching models."""
+    _ROPE_DICT.clear()
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,

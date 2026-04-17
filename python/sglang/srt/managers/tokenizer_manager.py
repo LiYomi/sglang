@@ -60,8 +60,11 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    ModelCpuReadyNotification,
+    ModelTokenizerReadyNotification,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    RegisterModelReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -222,6 +225,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        # Multi-model: tokenizer cache {model_name -> tokenizer}
+        model_name = self.served_model_name or self.model_path
+        self.model_tokenizers = {model_name: self.tokenizer}
+
+        # Multi-model readiness tracker. A model is "ready" only when all three
+        # sides (tokenizer_manager tokenizer, detokenizer tokenizer, scheduler
+        # CPU weights) have completed loading. Requests with model_name not in
+        # this map or not fully ready are rejected at the request gate so we
+        # never tokenize something we can't later detokenize.
+        self._model_readiness: Dict[str, Dict[str, Any]] = {
+            model_name: {
+                "tokenizer": True,
+                "detokenizer": True,
+                "cpu": True,
+                "error": None,
+            }
+        }
 
     def init_model_config(self):
         server_args = self.server_args
@@ -464,6 +485,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ModelCpuReadyNotification, self._handle_model_cpu_ready),
+                (
+                    ModelTokenizerReadyNotification,
+                    self._handle_model_tokenizer_ready,
+                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -507,6 +533,34 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
+            # Multi-model: gate on readiness (tokenizer + detokenizer + cpu all
+            # loaded) so we never tokenize something that can't later be
+            # decoded or served. Clients are expected to poll GET /v1/models
+            # before sending requests; this is the hard safety check.
+            model_name = obj.model_name
+            if model_name:
+                if not self.model_is_ready(model_name):
+                    status = self.model_status(model_name)
+                    if status == "unknown":
+                        raise ValueError(
+                            f"Model '{model_name}' is not registered. "
+                            f"Registered: {list(self.model_tokenizers.keys())}"
+                        )
+                    raise ValueError(
+                        f"Model '{model_name}' not ready (status={status}). "
+                        f"Poll GET /v1/models until ready before sending requests."
+                    )
+                # Snapshot the per-request tokenizer into a local so downstream
+                # await points can't have it swapped under us by a concurrent
+                # request for a different model.
+                request_tokenizer = self.model_tokenizers[model_name]
+            else:
+                request_tokenizer = self.tokenizer
+            # Keep self.tokenizer pointing at the current request's tokenizer
+            # for legacy callers (logger, default paths) that still read it
+            # directly. New code should prefer request_tokenizer.
+            self.tokenizer = request_tokenizer
+
             await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
@@ -973,6 +1027,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 routing_key=obj.routing_key,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                model_name=getattr(obj, "model_name", None),
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -2160,6 +2215,91 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """Put some custom force exit logic here."""
         pass
 
+    # ------------------------------------------------------------------
+    # Multi-model readiness
+    # ------------------------------------------------------------------
+
+    def register_model_pending(self, model_name: str) -> None:
+        """Mark a model as registered, all three sides still loading."""
+        self._model_readiness.setdefault(
+            model_name,
+            {"tokenizer": False, "detokenizer": False, "cpu": False, "error": None},
+        )
+
+    def mark_model_side_ready(
+        self, model_name: str, side: str, error: Optional[str] = None
+    ) -> None:
+        """Flip one side (tokenizer/detokenizer/cpu) of the readiness triple.
+
+        No-op if the model was rolled back (pop'd from `_model_readiness`)
+        between the background load starting and finishing; otherwise a late
+        ACK would resurrect a cancelled registration.
+        """
+        state = self._model_readiness.get(model_name)
+        if state is None:
+            return
+        if error:
+            state["error"] = error
+        else:
+            state[side] = True
+
+    def model_is_ready(self, model_name: Optional[str]) -> bool:
+        if not model_name:
+            return True  # default model is always ready
+        state = self._model_readiness.get(model_name)
+        if state is None:
+            return False
+        if state["error"]:
+            return False
+        return state["tokenizer"] and state["detokenizer"] and state["cpu"]
+
+    def model_status(self, model_name: str) -> str:
+        state = self._model_readiness.get(model_name)
+        if state is None:
+            return "unknown"
+        if state["error"]:
+            return "failed"
+        if state["tokenizer"] and state["detokenizer"] and state["cpu"]:
+            return "ready"
+        return "loading"
+
+    def list_model_status(self) -> Dict[str, Dict[str, Any]]:
+        """Return status for every model the user has seen through register_model.
+
+        Iterates `_model_readiness` (not `model_tokenizers`) so a model that
+        was just registered but hasn't finished loading yet still appears
+        with status="loading".
+        """
+        result: Dict[str, Dict[str, Any]] = {}
+        for name, state in self._model_readiness.items():
+            result[name] = {
+                "status": self.model_status(name),
+                "error": state.get("error"),
+            }
+        return result
+
+    def _handle_model_cpu_ready(self, recv_obj: ModelCpuReadyNotification):
+        self.mark_model_side_ready(
+            recv_obj.model_name,
+            "cpu",
+            error=recv_obj.error if not recv_obj.success else None,
+        )
+        logger.info(
+            f"Model readiness: {recv_obj.model_name} cpu="
+            f"{'ready' if recv_obj.success else f'failed ({recv_obj.error})'}"
+        )
+
+    def _handle_model_tokenizer_ready(self, recv_obj: ModelTokenizerReadyNotification):
+        self.mark_model_side_ready(
+            recv_obj.model_name,
+            "detokenizer",
+            error=recv_obj.error if not recv_obj.success else None,
+        )
+        logger.info(
+            f"Model readiness: {recv_obj.model_name} detokenizer="
+            f"{'ready' if recv_obj.success else f'failed ({recv_obj.error})'}"
+        )
+
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
@@ -2474,6 +2614,58 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+
+    def register_model_local(
+        self, model_name: str, model_path: str
+    ) -> RegisterModelReqOutput:
+        """Kick off background load of a new model's tokenizer.
+
+        Returns immediately after marking the model as pending. The caller
+        (register_model_communicator) is expected to notify the scheduler
+        right after; both sides flip their readiness flag asynchronously via
+        ModelTokenizerReadyNotification / ModelCpuReadyNotification.
+
+        Idempotent: re-registering the same model name is a no-op (whether
+        the first load is still running, already done, or already failed) —
+        starting a second loader thread would just duplicate work and race
+        on `model_tokenizers[model_name]`.
+        """
+        if model_name in self._model_readiness:
+            return RegisterModelReqOutput(
+                success=True,
+                message=f"Model {model_name} already registered (status={self.model_status(model_name)})",
+            )
+
+        self.register_model_pending(model_name)
+        server_args = self.server_args
+
+        def _load():
+            try:
+                new_tokenizer = get_tokenizer(
+                    model_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+                if model_name not in self._model_readiness:
+                    # Rolled back while loading — drop the tokenizer.
+                    logger.info(
+                        f"TokenizerManager dropping loaded tokenizer for "
+                        f"'{model_name}' (registration was rolled back)"
+                    )
+                    return
+                self.model_tokenizers[model_name] = new_tokenizer
+                self.mark_model_side_ready(model_name, "tokenizer")
+                logger.info(f"TokenizerManager cached tokenizer: {model_name}")
+            except Exception as e:
+                logger.exception(f"Failed to cache tokenizer {model_name}")
+                self.mark_model_side_ready(
+                    model_name, "tokenizer", error=str(e)
+                )
+
+        threading.Thread(target=_load, daemon=True).start()
+        return RegisterModelReqOutput(
+            success=True, message=f"Model {model_name} queued"
+        )
 
 
 class ServerStatus(Enum):

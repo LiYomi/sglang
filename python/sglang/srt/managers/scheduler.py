@@ -19,7 +19,7 @@ import os
 import signal
 import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -121,6 +121,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    RegisterModelReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -182,6 +183,8 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.host_model_manager import get_host_model_manager
+from sglang.srt.mem_cache.kv_transfer import KVTransfer
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -380,6 +383,9 @@ class Scheduler(
         # Init mamba backend
         self.init_mamba_backend()
 
+        # Init CPU model cache before model worker (model_runner._load_model_bump needs it)
+        self.init_host_model_mgr()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -388,6 +394,9 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
+
+        # Init KV transfer + hot-switch state (queue, parked reqs, preload bookkeeping)
+        self.init_hot_switch_state()
 
         # Init running status
         self.init_running_status()
@@ -435,6 +444,7 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.active_model_name = self.server_args.served_model_name or self.server_args.model_path
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
@@ -696,6 +706,54 @@ class Scheduler(
             self.metrics_collector.emit_cache_config_info(
                 self.page_size, self.max_total_num_tokens // self.page_size
             )
+
+    def init_host_model_mgr(self):
+        """Initialize global host model manager for multi-model hot-switching."""
+        if self.server_args.enable_bump_allocator:
+            self._host_model_mgr = get_host_model_manager()
+            self._host_model_mgr.register(self.active_model_name, self.server_args.model_path)
+        else:
+            self._host_model_mgr = None
+
+    def init_hot_switch_state(self):
+        """Initialize per-session state for multi-model hot-switching.
+
+        Includes the continuous D2H KV transfer helper, the FIFO switch queue,
+        the per-target parked-request buckets (for requests targeting a model
+        that isn't currently active), and preload-thread bookkeeping.
+        """
+        self._kv_transfer = KVTransfer() if self.server_args.enable_bump_allocator else None
+        self._preload_thread = None
+        self._preload_manager = None
+        self._preload_attempted_target = None  # dedup: prevent re-triggering for same target
+        self._switch_queue: Deque[Tuple[str, str, float]] = deque()  # FIFO of (name, path, request_ts)
+        self._parked_reqs_by_model: Dict[str, List[Req]] = defaultdict(list)
+        # Queue filled from background CPU-load threads (host_model_mgr). The
+        # scheduler's event loop drains it and emits ModelCpuReadyNotification
+        # IPCs to tokenizer_manager — ZMQ sockets aren't thread-safe so the
+        # callback itself must not touch send_to_tokenizer.
+        import queue as _queue
+        self._cpu_ready_queue: _queue.Queue = _queue.Queue()
+
+    # ------------------------------------------------------------------
+    # Public accessors for model_switch orchestration.
+    # Exposed so callers don't reach into the private preload/host fields.
+    # ------------------------------------------------------------------
+    @property
+    def host_model_mgr(self):
+        """Host-side CPU model cache; None when bump allocator is disabled."""
+        return self._host_model_mgr
+
+    @property
+    def active_preload_manager(self):
+        """PreloadManager holding the latest staging state, or None."""
+        return self._preload_manager
+
+    def wait_for_preload(self) -> None:
+        """Block until any in-flight weight preload thread has finished."""
+        thread = self._preload_thread
+        if thread is not None and thread.is_alive():
+            thread.join()
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
@@ -1225,6 +1283,7 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (RegisterModelReqInput, self.register_model),
             ]
         )
 
@@ -1281,6 +1340,9 @@ class Scheduler(
                 self.cancel_bubble_timer()
                 continue
 
+            # Execute deferred model switch before scheduling new batches
+            self._execute_pending_switch()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1292,6 +1354,8 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
+            # Check if a model needs preloading (non-blocking, runs in background thread)
+            self._check_preload()
 
             # Update last_batch
             self.last_batch = batch
@@ -1318,6 +1382,8 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
+            # Execute deferred model switch before scheduling new batches
+            self._execute_pending_switch()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
@@ -1342,6 +1408,8 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+            # Check if a model needs preloading (non-blocking, runs in background thread)
+            self._check_preload()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1713,6 +1781,11 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # Multi-model: remember target model so _add_request_to_queue can
+            # park the req until that model is active. model_name is a declared
+            # Optional field on TokenizedGenerateReqInput.
+            target_model = recv_req.model_name
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1746,6 +1819,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
+            req.model_name = target_model  # may be None; _add_request_to_queue defaults to active
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1903,6 +1977,16 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
+            # Multi-model: park reqs whose target isn't the active model and
+            # make sure the switch is enqueued. They will be flushed back into
+            # waiting_queue by _execute_model_switch after the switch completes
+            # (which re-enters this function and runs the normal path below,
+            # including priority / quota checks and the wait_queue time stamp).
+            target = getattr(req, "model_name", None) or self.active_model_name
+            if target != self.active_model_name:
+                self._prepare_model_switch(target)
+                self._parked_reqs_by_model[target].append(req)
+                return
             if not self._set_or_validate_priority(req):
                 return
             if self._abort_on_queued_limit(req):

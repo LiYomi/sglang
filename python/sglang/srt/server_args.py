@@ -649,6 +649,8 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
+    enable_bump_allocator: bool = False
+    mem_fraction_bump: float = 0.95  # fraction of available GPU memory for bump allocator
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
@@ -5552,6 +5554,17 @@ class ServerArgs:
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
         parser.add_argument(
+            "--enable-bump-allocator",
+            action="store_true",
+            help="Use bump allocator for self-managed VRAM (model hot-switching)",
+        )
+        parser.add_argument(
+            "--mem-fraction-bump",
+            type=float,
+            default=0.95,
+            help="Fraction of available GPU memory for bump allocator (default 0.95)",
+        )
+        parser.add_argument(
             "--enable-weights-cpu-backup",
             action="store_true",
             help="Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
@@ -6054,6 +6067,28 @@ class ServerArgs:
         assert (
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        # Bump allocator requires memory saver (VMM graph pool) to handle CUDA
+        # graph pages across model switches. Running without it silently skips
+        # graph-pool isolation and later switches will reuse stale pages.
+        if self.enable_bump_allocator:
+            assert self.enable_memory_saver, (
+                "--enable-bump-allocator requires --enable-memory-saver for "
+                "CUDA graph VMM pool isolation during model switch."
+            )
+            assert 0.0 < self.mem_fraction_bump <= 1.0, (
+                "--mem-fraction-bump must be in (0, 1]"
+            )
+            # Bump + weight staging currently only plugs into the page_size=1
+            # TokenToKVPoolAllocator (the only branch that takes lifo_mode).
+            # Paged / SWA / NPU / HiSparse allocators would silently run
+            # without LIFO, breaking the staging tail-slot guarantee.
+            if self.page_size is not None and self.page_size != 1:
+                assert False, (
+                    f"--enable-bump-allocator requires page_size == 1 "
+                    f"(got {self.page_size}); other allocator variants do "
+                    f"not support the LIFO free-list required by weight staging."
+                )
 
         if self.pp_size > 1:
             assert (
