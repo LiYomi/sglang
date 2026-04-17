@@ -11,6 +11,11 @@ from sglang.srt.utils import is_npu
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 
 
+def clear_forward_input_buffer_pool() -> None:
+    """Drop every cached forward input buffer. Used when switching models."""
+    _forward_input_buffer_pool.clear()
+
+
 @dataclass
 class ForwardInputBuffers:
 

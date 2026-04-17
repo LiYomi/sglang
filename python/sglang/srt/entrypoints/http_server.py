@@ -129,6 +129,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
+    RegisterModelReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
@@ -1190,6 +1191,40 @@ async def resume_memory_occupation(
     except Exception as e:
         return _create_error_response(e)
 
+
+@app.api_route("/register_model", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def register_model(obj: RegisterModelReqInput, request: Request):
+    """Register a new model for multi-model serving."""
+    try:
+        result = await _global_state.tokenizer_manager.register_model(obj, request)
+        return ORJSONResponse(result)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/list_models", methods=["GET"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_models(request: Request):
+    """List registered models with per-model readiness.
+
+    A model's status is "ready" only when tokenizer_manager tokenizer,
+    detokenizer tokenizer, and scheduler CPU weights are all loaded. Clients
+    should poll this endpoint and wait for status="ready" before sending
+    requests — unready models are rejected at the request gate.
+    """
+    try:
+        states = _global_state.tokenizer_manager.list_model_status()
+    except AttributeError:
+        # Multi-model readiness tracking disabled (older tokenizer_manager).
+        return ORJSONResponse({"object": "list", "data": []})
+    data = []
+    for name in sorted(states):
+        entry = {"id": name, "object": "model", "status": states[name]["status"]}
+        if states[name].get("error"):
+            entry["error"] = states[name]["error"]
+        data.append(entry)
+    return ORJSONResponse({"object": "list", "data": data})
 
 @app.post("/weights_checker")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)

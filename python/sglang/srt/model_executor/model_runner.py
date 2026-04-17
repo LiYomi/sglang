@@ -120,6 +120,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.vram_manager import _align_up
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
@@ -463,6 +464,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+
+        # Bump allocator for model hot-switching
+        self.vram_mgr = None
+        if self.server_args.enable_bump_allocator:
+            from sglang.srt.mem_cache.vram_manager import BumpVramAllocator
+            from sglang.srt.utils.common import get_available_gpu_memory
+            avail_gb = get_available_gpu_memory(self.device, self.gpu_id)
+            fraction = getattr(self.server_args, "mem_fraction_bump", 0.95)
+            managed_bytes = int(avail_gb * fraction * 1024**3)
+            logger.info(f"Bump: avail={avail_gb:.1f}GB, fraction={fraction}, managed={managed_bytes/1024**3:.2f}GB")
+            self.vram_mgr = BumpVramAllocator(managed_bytes, self.device)
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
@@ -1060,6 +1072,170 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+    def _migrate_params_to_bump(self, skip_region_alloc=False):
+        """Migrate model parameters and buffers from CPU to bump buffer via H2D.
+
+        In-place rebinds each param.data to a bump tensor view (zero-copy on
+        GPU after the H2D). Keeping the original ``Parameter`` object alive
+        preserves extra attributes that quant / LoRA wrappers attach
+        (``weight_loader``, ``weight_scale``, ``group_size`` etc.) — replacing
+        with a fresh ``Parameter(managed)`` would drop them.
+
+        If skip_region_alloc is True, caller is responsible for region management.
+        """
+        bump = self.vram_mgr
+
+        # Calculate total size
+        param_bytes = sum(_align_up(p.numel() * p.element_size()) for p in self.model.parameters())
+        sd_keys = set(self.model.state_dict().keys())
+        persistent_buf_bytes = sum(
+            _align_up(b.numel() * b.element_size()) for n, b in self.model.named_buffers()
+            if b is not None and b.numel() > 0 and n in sd_keys
+        )
+        total_bytes = param_bytes + persistent_buf_bytes
+        logger.info(f"Bump: params={param_bytes / 1024**2:.1f} MB, "
+                    f"persistent_buffers={persistent_buf_bytes / 1024**2:.1f} MB, "
+                    f"total={total_bytes / 1024**2:.1f} MB")
+
+        if not skip_region_alloc:
+            bump.reset_region("weights", total_bytes)
+
+        # H2D parameters — rebind .data in-place to preserve wrapper attrs
+        h2d_stream = torch.cuda.Stream()
+        for name, p in self.model.named_parameters():
+            managed = bump.create_tensor("weights", p.shape, p.dtype)
+            with torch.cuda.stream(h2d_stream):
+                managed.copy_(p.data, non_blocking=True)
+            p.data = managed
+            # Parameter.data rebind does NOT flip requires_grad, and loaders
+            # often leave it at the Parameter default (True). Inference runs
+            # under no_grad today so it is harmless, but make the invariant
+            # explicit to match the old `Parameter(managed, requires_grad=False)`.
+            p.requires_grad_(False)
+
+        # H2D persistent buffers
+        persistent_bufs = [(n, b) for n, b in self.model.named_buffers()
+                           if b is not None and b.numel() > 0 and n in sd_keys]
+        for buf_name, buf in persistent_bufs:
+            managed = bump.create_tensor("weights", buf.shape, buf.dtype)
+            with torch.cuda.stream(h2d_stream):
+                managed.copy_(buf.data, non_blocking=True)
+            parts = buf_name.split(".")
+            module = self.model
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            module._buffers[parts[-1]] = managed
+        if persistent_bufs:
+            logger.info(f"Bump: {len(persistent_bufs)} persistent buffers migrated")
+
+        h2d_stream.synchronize()
+        logger.info(f"Bump: weights migrated, "
+                    f"used {bump.regions['weights'].used / 1024**2:.1f} MB")
+
+    def _estimate_runtime_bytes(self):
+        """Estimate runtime region size: flashinfer workspace + decode input buffers."""
+        from sglang.srt.environ import envs
+        ws_size = (2048 * 1024 * 1024 if self.server_args.enable_deterministic_inference
+                   else envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get())
+        archs = getattr(self.model_config.hf_config, 'architectures', []) or []
+        if any(a.startswith(('Qwen2', 'Qwen3', 'MiMo')) for a in archs):
+            ws_size = max(ws_size, 512 * 1024 * 1024)
+
+        buf_size = 0
+        if not self.server_args.disable_cuda_graph:
+            max_bs = max(self.server_args.cuda_graph_bs)
+            max_num_token = max_bs
+            hidden_size = self.model_config.hidden_size
+            vocab_size = self.model_config.vocab_size
+            dtype_size = 2 if self.model_config.dtype in (torch.float16, torch.bfloat16) else 4
+            buf_size = (
+                max_num_token * 8                          # input_ids (int64)
+                + max_num_token * hidden_size * dtype_size  # input_embeds
+                + max_bs * 8                               # req_pool_indices (int64)
+                + max_bs * 4                               # seq_lens (int32)
+                + max_num_token * 8                        # out_cache_loc (int64)
+                + max_num_token * 8                        # positions (int64)
+                + 3 * max_num_token * 8                    # mrope_positions (int64)
+                + 4                                        # num_token_non_padded (int32)
+                + max_num_token * vocab_size * 4            # next_token_logits_buffer (float32)
+            )
+            buf_size = int(buf_size * 1.1)  # 10% headroom for alignment
+        return ws_size, buf_size
+
+    def _init_runtime_region(self):
+        """Allocate bump 'runtime' region for flashinfer workspace + decode input buffers."""
+        bump = self.vram_mgr
+        ws_size, buf_size = self._estimate_runtime_bytes()
+        total_size = ws_size + buf_size
+        bump.reset_region("runtime", total_size)
+        logger.info(f"Bump: runtime reserve={total_size/1024**2:.0f}MB "
+                    f"(workspace={ws_size/1024**2:.0f}MB, buffers={buf_size/1024**2:.0f}MB)")
+
+
+    def _load_model_bump(self, model_name=None, skip_region_alloc=False):
+        """Load model into bump buffer. Gets CPU model from global HostModelManager.
+
+        First call (startup): cache.load() does disk → CPU → pin, then H2D.
+        Subsequent calls (switch fallback): restores pinned params from cache, then H2D.
+
+        Any failure here leaves the runner in a half-initialised state
+        (weights region present but ``self.model`` possibly stale or None).
+        Propagate the error with a clear prefix so callers can either crash
+        the process or fall back to recovery logic.
+        """
+        from sglang.srt.mem_cache.host_model_manager import get_host_model_manager
+
+        model_name = model_name or self.server_args.served_model_name
+        try:
+            cache = get_host_model_manager()
+            entry = cache.get_entry(model_name)
+
+            # First load: trigger disk → CPU → pin
+            if entry.cpu_model is None:
+                cache.load(model_name)
+
+            # Wait for loading to finish
+            cpu_model = cache.get_cpu_model(model_name)
+
+            # Restore pinned CPU data (previous _migrate replaced them with GPU bump views)
+            for name, tensor in entry.cpu_state_dict.items():
+                parts = name.split(".")
+                module = cpu_model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                attr_name = parts[-1]
+                # Parameters
+                if isinstance(getattr(module, attr_name, None), torch.nn.Parameter):
+                    getattr(module, attr_name).data = tensor
+                # Persistent buffers
+                elif attr_name in module._buffers:
+                    module._buffers[attr_name] = tensor
+
+            self.model = cpu_model
+            self.model.eval()
+
+            # Migrate parameters to bump (H2D)
+            self._migrate_params_to_bump(skip_region_alloc=skip_region_alloc)
+            self._finalize_model_on_gpu()
+        except Exception as e:
+            logger.error(
+                f"Bump load_model failed for '{model_name}': {e}",
+                exc_info=True,
+            )
+            raise
+
+    def _finalize_model_on_gpu(self):
+        """Move non-persistent buffers to GPU and recompute RoPE cache."""
+        for name, buf in self.model.named_buffers():
+            if buf is not None and buf.device.type == "cpu":
+                parts = name.split(".")
+                module = self.model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module._buffers[parts[-1]] = buf.to(self.device)
+        from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
+        reserve_rope_cache_for_long_sequences(self.model, self.server_args, self.model_config)
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1137,25 +1313,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
 
-        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
-            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
-        )
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=enable_cpu_backup,
-        ):
-            self.loader = get_model_loader(
-                load_config=self.load_config,
-                model_config=self.model_config,
+        # Bump allocator path: meta-device init + managed buffer
+        if self.vram_mgr is not None:
+            self._init_runtime_region()  # runtime at offset 0 (fixed position)
+            self._load_model_bump()
+        else:
+            enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
+                self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
             )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
-            )
-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_transfer_engine_weight_info = (
-                    self.loader.remote_instance_transfer_engine_weight_info
+            with self.memory_saver_adapter.region(
+                GPU_MEMORY_TYPE_WEIGHTS,
+                enable_cpu_backup=enable_cpu_backup,
+            ):
+                self.loader = get_model_loader(
+                    load_config=self.load_config,
+                    model_config=self.model_config,
                 )
+                self.model = self.loader.load_model(
+                    model_config=self.model_config,
+                    device_config=DeviceConfig(self.device, self.gpu_id),
+                )
+                if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
+                    self.remote_instance_transfer_engine_weight_info = (
+                        self.loader.remote_instance_transfer_engine_weight_info
+                    )
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:

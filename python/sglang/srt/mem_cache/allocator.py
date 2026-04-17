@@ -20,6 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
+import contextlib
 from typing import TYPE_CHECKING
 
 import torch
@@ -124,8 +125,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        lifo_mode: bool = False,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        self._lifo_mode = lifo_mode
+        self._staging_lock = None    # set during preload for thread-safe free_pages access
+        self._preload_mgr = None     # set during preload for chunk dirty tracking
+        self._reserved_range = None  # (lo, hi) rows currently being H2D'd, alloc must avoid
+        self._high_water_mark = 0    # highest slot index ever allocated (reset on clear)
         self.clear()
 
     def clear(self):
@@ -136,33 +143,109 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._high_water_mark = 0
+
+    @property
+    def staging_floor(self) -> int:
+        """Lowest slot index safe for staging: above any slot ever allocated."""
+        return self._high_water_mark + 1
+
+    def attach_staging(self, lock, preload_mgr) -> None:
+        """Install shared lock + preload manager for a staging preload run.
+        Lock guards free_pages access; preload_mgr receives dirty-page marks on alloc."""
+        self._staging_lock = lock
+        self._preload_mgr = preload_mgr
+
+    def detach_staging(self) -> None:
+        """Release the shared lock after preload completes.
+        _preload_mgr is kept alive until the switch consumes dirty flags."""
+        self._staging_lock = None
+
+    @contextlib.contextmanager
+    def staging_chunk_guard(self, lo: int, hi: int):
+        """Reserve [lo, hi) for the current H2D chunk while the lock is held.
+
+        Main-thread alloc acquires the same lock before reading _reserved_range,
+        so while the guard is active alloc cannot race between "reserved_range is None"
+        and the background thread actually setting it.
+        """
+        lock = self._staging_lock
+        with lock if lock is not None else contextlib.nullcontext():
+            self._reserved_range = (lo, hi)
+            try:
+                yield
+            finally:
+                self._reserved_range = None
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
     def alloc(self, need_size: int):
-        if self.need_sort and need_size > len(self.free_pages):
-            self.merge_and_sort_free()
+        _lk = self._staging_lock
+        if _lk:
+            _lk.acquire()
+        try:
+            # TODO FIX logic when enable PD.
+            if self.need_sort and need_size > len(self.free_pages):
+                self.merge_and_sort_free()
 
-        if need_size > len(self.free_pages):
-            return None
+            # Skip slots in the active H2D chunk (reserved by staging)
+            if self._reserved_range is not None:
+                lo, hi = self._reserved_range
+                mask = (self.free_pages < lo) | (self.free_pages >= hi)
+                available = self.free_pages[mask]
+                reserved = self.free_pages[~mask]
+                if need_size > len(available):
+                    return None
+                select_index = available[:need_size]
+                # May result staging block not contiguous, but can optimize sort overhead.
+                self.free_pages = torch.cat((available[need_size:], reserved))
+            else:
+                if need_size > len(self.free_pages):
+                    return None
+                select_index = self.free_pages[:need_size]
+                self.free_pages = self.free_pages[need_size:]
 
-        select_index = self.free_pages[:need_size]
-        self.free_pages = self.free_pages[need_size:]
-        return select_index
+            if self._preload_mgr is not None:
+                self._preload_mgr.mark_dirty_pages(select_index)
+            if self._lifo_mode:
+                # CPU-side proxy for `max slot index ever allocated`:
+                # LIFO puts freed slots back at the front of free_pages, so
+                # the only time alloc dips into indices beyond the previous
+                # peak is when total live allocations exceed that peak. Use
+                # the live count (size - |free_pages|) as the bound and skip
+                # the GPU→CPU sync that `select_index.max().item()` caused on
+                # every alloc.
+                live = self.size - len(self.free_pages)
+                if live > self._high_water_mark:
+                    self._high_water_mark = live
+            return select_index
+        finally:
+            if _lk:
+                _lk.release()
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
-            if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
+        _lk = self._staging_lock
+        if _lk:
+            _lk.acquire()
+        try:
+            if self.is_not_in_free_group:
+                if self.need_sort:
+                    self.release_pages = torch.cat((self.release_pages, free_index))
+                elif self._lifo_mode:
+                    # LIFO: prepend freed slots so they are reused first.
+                    self.free_pages = torch.cat((free_index, self.free_pages))
+                else:
+                    self.free_pages = torch.cat((self.free_pages, free_index))
             else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
-        else:
-            self.free_group.append(free_index)
+                self.free_group.append(free_index)
+        finally:
+            if _lk:
+                _lk.release()
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

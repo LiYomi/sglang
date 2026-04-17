@@ -755,7 +755,9 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        vram_mgr=None,
     ):
+        self.vram_mgr = vram_mgr
         super().__init__(
             size,
             page_size,
@@ -840,30 +842,60 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+        bump = self.vram_mgr
+        if bump is not None:
+            from math import prod
+
+            from sglang.srt.mem_cache.vram_manager import _align_up
+
+            k_shape = (self.size + self.page_size, self.head_num, self.head_dim)
+            v_shape = (self.size + self.page_size, self.head_num, self.v_head_dim)
+            elem_size = self.store_dtype.itemsize
+            # Align each per-layer buffer before summing so the reserved
+            # region matches what `create_tensor` will actually consume (it
+            # aligns every allocation up to 256 bytes).
+            k_bytes = _align_up(prod(k_shape) * elem_size)
+            v_bytes = _align_up(prod(v_shape) * elem_size)
+            total_kv_bytes = (k_bytes + v_bytes) * self.layer_num
+            bump.reset_region("kv_cache", total_kv_bytes)
+
+            def _alloc_kv(shape):
+                t = bump.create_tensor("kv_cache", shape, self.store_dtype)
+                t.zero_()
+                return t
+
+            # Bump mode manages its own single VMM buffer (allocated once in
+            # BumpVramAllocator.__init__) and owns the lifetime of the KV
+            # region via reset_region. memory_saver_adapter would layer a
+            # second VMM tracker on top, with no way to reconcile the two on
+            # pause/resume — so we bypass it for the bump KV path.
+            self.k_buffer = [_alloc_kv(k_shape) for _ in range(self.layer_num)]
+            self.v_buffer = [_alloc_kv(v_shape) for _ in range(self.layer_num)]
+        else:
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.v_head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],

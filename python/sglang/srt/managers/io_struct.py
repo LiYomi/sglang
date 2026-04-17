@@ -219,6 +219,9 @@ class GenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
+    # Multi-model: client-provided model name; detokenizer selects tokenizer by it.
+    model_name: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -734,6 +737,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
+    # Multi-model: client-provided model name; detokenizer selects tokenizer by it.
+    model_name: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -1006,6 +1012,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # Multi-model: client-provided model name; detokenizer selects tokenizer by it.
+    model_name: Optional[str] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1067,6 +1076,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # Multi-model: client-provided model name; detokenizer selects tokenizer by it.
+    model_name: Optional[str] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1099,6 +1111,9 @@ class BatchEmbeddingOutput(BaseBatchReq):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Multi-model: client-provided model name; detokenizer selects tokenizer by it.
+    model_name: Optional[str] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
@@ -1954,3 +1969,40 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+@dataclass
+class RegisterModelReqInput(BaseReq):
+    """Register a new model for multi-model serving.
+
+    Required fields (contrasts with generate requests where model_name is
+    Optional) — you must always name the model you're registering.
+    """
+    model_name: str
+    model_path: str
+
+@dataclass
+class RegisterModelReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+@dataclass
+class RegisterModelNotification:
+    """Sent from scheduler to detokenizer to pre-cache tokenizer."""
+    model_name: str
+    model_path: str
+
+
+@dataclass
+class ModelCpuReadyNotification:
+    """scheduler -> tokenizer_manager once host_model_mgr finishes CPU load."""
+    model_name: str
+    success: bool
+    error: str = ""
+
+
+@dataclass
+class ModelTokenizerReadyNotification:
+    """detokenizer -> tokenizer_manager once its tokenizer load finishes."""
+    model_name: str
+    success: bool
+    error: str = ""
