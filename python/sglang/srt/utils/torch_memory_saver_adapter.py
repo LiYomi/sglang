@@ -58,6 +58,24 @@ class TorchMemorySaverAdapter(ABC):
         raise NotImplementedError
 
 
+import threading as _threading
+_tag_suffix_state = _threading.local()
+
+
+def _get_tag_suffix() -> str:
+    return getattr(_tag_suffix_state, "value", "")
+
+
+def set_per_model_tag_suffix(suffix: str):
+    """Set thread-local suffix; subsequent region(tag) calls produce f'{tag}:{suffix}'."""
+    _tag_suffix_state.value = suffix or ""
+
+
+def _decorate_tag(tag: str) -> str:
+    suf = _get_tag_suffix()
+    return f"{tag}:{suf}" if suf else tag
+
+
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     """Adapter for TorchMemorySaver with tag-based control"""
 
@@ -65,7 +83,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return torch_memory_saver.configure_subprocess()
 
     def region(self, tag: str, enable_cpu_backup: bool = False):
-        return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+        return _memory_saver.region(tag=_decorate_tag(tag), enable_cpu_backup=enable_cpu_backup)
 
     def cuda_graph(self, **kwargs):
         return _memory_saver.cuda_graph(**kwargs)

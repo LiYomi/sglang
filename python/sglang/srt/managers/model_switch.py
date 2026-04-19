@@ -129,10 +129,19 @@ def _build_context(
 
 def _force_flush_cache(scheduler: "Scheduler") -> None:
     """Drop tree cache / KV allocator / grammar state (bypass the idle check)."""
-    scheduler.tree_cache.reset()
-    if scheduler.token_to_kv_pool_allocator is not None:
-        scheduler.token_to_kv_pool_allocator.clear()
-    scheduler.grammar_manager.clear()
+    # Wrap in tms region so the new tree_cache big tensor is per-model tagged.
+    msa = getattr(scheduler, "memory_saver_adapter", None)
+    if msa is not None and msa.enabled:
+        with msa.region("flush"):
+            scheduler.tree_cache.reset()
+            if scheduler.token_to_kv_pool_allocator is not None:
+                scheduler.token_to_kv_pool_allocator.clear()
+            scheduler.grammar_manager.clear()
+    else:
+        scheduler.tree_cache.reset()
+        if scheduler.token_to_kv_pool_allocator is not None:
+            scheduler.token_to_kv_pool_allocator.clear()
+        scheduler.grammar_manager.clear()
     logger.info("Cache force-flushed for model switch")
 
 
@@ -427,12 +436,16 @@ def _load_via_h2d_fallback(ctx: _SwitchContext, cpu_model, cpu_sd) -> None:
     else:
         total_weight_bytes = 0
 
+    _diag_cuda_mem("p2_fb_start", ctx.prev_model_name, ctx.target_model_name)
     bump.release_region("kv_cache")
+    _diag_cuda_mem("p2_fb_after_release_kv", ctx.prev_model_name, ctx.target_model_name)
     if "weights" in bump.regions:
         bump.reset_region("weights", total_weight_bytes)
     else:
         bump.allocate_region("weights", total_weight_bytes)
+    _diag_cuda_mem("p2_fb_after_reset_weights", ctx.prev_model_name, ctx.target_model_name)
     runner._load_model_bump(model_name=ctx.target_model_name, skip_region_alloc=True)
+    _diag_cuda_mem("p2_fb_after_load_bump", ctx.prev_model_name, ctx.target_model_name)
 
 
 # ==========================================================================
@@ -456,6 +469,17 @@ def _kv_restore_placeholder(ctx: _SwitchContext, kv_cached) -> None:
     if "kv_cache" in bump.regions:
         bump.release_region("kv_cache")
     runner._init_runtime_region()
+
+    # Resume per-model KV metadata physical pages before reusing cached pool
+    # objects. Phase 1 paused tag=f"kv_cache:{prev}" when switching away;
+    # the cached req_to_token tensor's VA was unmapped, so we must remap it
+    # before any kernel touches it.
+    if ctx.memory_saver is not None and ctx.memory_saver.enabled:
+        for _t in ("kv_cache",):
+            try:
+                ctx.memory_saver.resume(f"{_t}:{ctx.target_model_name}")
+            except Exception as e:
+                logger.warning(f"  resume {_t}:{ctx.target_model_name} failed: {e}")
 
     # Allocate with exact cached capacity. _phase_3_kv_cache already verified
     # that this fits in the remaining bump space — using min() here would let
@@ -482,16 +506,21 @@ def _kv_rebuild(ctx: _SwitchContext) -> None:
     runner = ctx.runner
     bump = ctx.bump
 
+    _diag_cuda_mem("p3_rebuild_start", ctx.prev_model_name, ctx.target_model_name)
     ctx.resource_cache.evict_kv_pool(ctx.target_model_name)
     if "kv_cache" in bump.regions:
         bump.release_region("kv_cache")
+    _diag_cuda_mem("p3_after_evict_release", ctx.prev_model_name, ctx.target_model_name)
 
     _force_flush_cache(scheduler)
+    _diag_cuda_mem("p3_after_flush", ctx.prev_model_name, ctx.target_model_name)
 
     _detach_pool_refs(ctx)
+    _diag_cuda_mem("p3_after_detach", ctx.prev_model_name, ctx.target_model_name)
 
     # Allocate runtime BEFORE KV so init_memory_pool doesn't consume all space.
     runner._init_runtime_region()
+    _diag_cuda_mem("p3_after_runtime", ctx.prev_model_name, ctx.target_model_name)
     logger.info(
         f"  KV pool init: num_heads={runner.model_config.num_attention_heads}, "
         f"num_kv_heads={runner.model_config.get_num_kv_heads(ctx.tp_size)}, "
@@ -499,6 +528,7 @@ def _kv_rebuild(ctx: _SwitchContext) -> None:
         f"num_layers={runner.model_config.num_hidden_layers}"
     )
     runner.init_memory_pool(0)
+    _diag_cuda_mem("p3_after_init_mem_pool", ctx.prev_model_name, ctx.target_model_name)
 
 
 # ==========================================================================
@@ -535,9 +565,12 @@ def _recapture_graphs(ctx: _SwitchContext) -> None:
 
     if ctx.tp_size > 1 and ctx.tp_cpu_group is not None:
         torch.distributed.barrier(group=ctx.tp_cpu_group)
+    _diag_cuda_mem("p4_before_piecewise", ctx.prev_model_name, ctx.target_model_name)
     ctx.runner.init_piecewise_cuda_graphs()
+    _diag_cuda_mem("p4_after_piecewise", ctx.prev_model_name, ctx.target_model_name)
     _set_graph_pool(None)
     ctx.runner.init_device_graphs()
+    _diag_cuda_mem("p4_after_device_graphs", ctx.prev_model_name, ctx.target_model_name)
     if ctx.tp_size > 1 and ctx.tp_cpu_group is not None:
         torch.distributed.barrier(group=ctx.tp_cpu_group)
 
@@ -550,17 +583,36 @@ def _recapture_graphs(ctx: _SwitchContext) -> None:
 def _phase_1_save_and_teardown(ctx: _SwitchContext) -> None:
     """Snapshot old model state + release GPU resources owned by it."""
     t0 = time.perf_counter()
+    _tlast = [t0]
+    def _tick(label):
+        now = time.perf_counter()
+        dt = (now - _tlast[0]) * 1000
+        _tlast[0] = now
+        logger.info(f"  P1_TIMING {label}: {dt:.1f}ms")
 
+    _diag_cuda_mem("p1_start", ctx.prev_model_name, ctx.target_model_name)
     ctx.resource_cache.save_graph(
         ctx.runner, ctx.prev_model_name, memory_saver_adapter=ctx.memory_saver
     )
+    _tick("save_graph")
+    _diag_cuda_mem("p1_after_save_graph", ctx.prev_model_name, ctx.target_model_name)
     ctx.resource_cache.save_kv_pool(ctx.prev_model_name, ctx.runner, ctx.bump)
+    _tick("save_kv_pool")
+    _diag_cuda_mem("p1_after_save_kv", ctx.prev_model_name, ctx.target_model_name)
 
     ctx.runner.graph_runner = None
+    _tick("clear_graph_runner")
     ctx.bump.release_region("runtime")
+    _tick("release_runtime")
+    _diag_cuda_mem("p1_after_release_runtime", ctx.prev_model_name, ctx.target_model_name)
     ctx.runner.attn_backend = None
+    _tick("clear_attn_backend")
     clear_rope_cache()
+    _tick("clear_rope_cache")
+    _diag_cuda_mem("p1_after_clear_rope", ctx.prev_model_name, ctx.target_model_name)
     reset_global_workspace_buffer()
+    _tick("reset_workspace_buffer")
+    _diag_cuda_mem("p1_after_reset_ws", ctx.prev_model_name, ctx.target_model_name)
 
     ctx.timings["save_teardown"] = time.perf_counter() - t0
     logger.info(f"  save_teardown: {ctx.timings['save_teardown']*1000:.1f}ms")
@@ -696,15 +748,28 @@ def _phase_4_runtime_and_graph(ctx: _SwitchContext) -> None:
             ctx.target_model_name,
             memory_saver_adapter=ctx.memory_saver,
         )
+        _diag_cuda_mem("p4_after_restore_graph", ctx.prev_model_name, ctx.target_model_name)
         if not graph_hit:
-            ctx.runner.init_attention_backend()
+            if ctx.memory_saver is not None and ctx.memory_saver.enabled:
+                with ctx.memory_saver.region("attn"):
+                    ctx.runner.init_attention_backend()
+            else:
+                ctx.runner.init_attention_backend()
+            _diag_cuda_mem("p4_after_init_attn", ctx.prev_model_name, ctx.target_model_name)
             clear_forward_input_buffer_pool()
             _recapture_graphs(ctx)
+            _diag_cuda_mem("p4_after_recapture", ctx.prev_model_name, ctx.target_model_name)
     else:
-        ctx.runner.init_attention_backend()
+        if ctx.memory_saver is not None and ctx.memory_saver.enabled:
+            with ctx.memory_saver.region("attn"):
+                ctx.runner.init_attention_backend()
+        else:
+            ctx.runner.init_attention_backend()
+        _diag_cuda_mem("p4_after_init_attn", ctx.prev_model_name, ctx.target_model_name)
         clear_forward_input_buffer_pool()
         if not ctx.scheduler.server_args.disable_cuda_graph:
             _recapture_graphs(ctx)
+            _diag_cuda_mem("p4_after_recapture", ctx.prev_model_name, ctx.target_model_name)
 
     ctx.timings["runtime_graph"] = time.perf_counter() - t0
     logger.info(f"  runtime_graph: {ctx.timings['runtime_graph']*1000:.1f}ms")
@@ -713,6 +778,16 @@ def _phase_4_runtime_and_graph(ctx: _SwitchContext) -> None:
 def _phase_5_finalize(ctx: _SwitchContext) -> None:
     """Propagate refs back to scheduler / worker and record total time."""
     _propagate_refs(ctx)
+
+    if ctx.memory_saver is not None and ctx.memory_saver.enabled and ctx.prev_model_name:
+        _diag_cuda_mem("p5_before_pause", ctx.prev_model_name, ctx.target_model_name)
+        for _t in ("kv_cache",):
+            try:
+                ctx.memory_saver.pause(f"{_t}:{ctx.prev_model_name}")
+            except Exception as e:
+                logger.warning(f"  pause {_t}:{ctx.prev_model_name} failed: {e}")
+        _diag_cuda_mem("p5_after_pause", ctx.prev_model_name, ctx.target_model_name)
+
     ctx.timings["total"] = time.perf_counter() - ctx.t_total_start
     logger.info(
         f"  SWITCH {ctx.prev_model_name} -> {ctx.target_model_name}: "
@@ -729,6 +804,51 @@ def _phase_5_finalize(ctx: _SwitchContext) -> None:
 # ==========================================================================
 
 
+def _diag_cuda_mem(tag: str, prev_model: str, target_model: str) -> None:
+    """[DIAG] Print torch.cuda.memory_stats key fields for OOM root-cause analysis.
+
+    SGLANG_SWITCH_DIAG levels:
+      unset / '0': skip all probes (zero overhead, fastest switch)
+      'bounds'   : only pre_switch / post_switch (measure fresh 显存净增, minimal latency impact)
+      '1' / 'full': all probes (heavy gc+sync per probe, breaks D2D latency)
+    """
+    import os
+    lvl = os.environ.get('SGLANG_SWITCH_DIAG', '0')
+    if lvl == '0':
+        return
+    if lvl == 'bounds' and tag not in ('pre_switch', 'post_switch'):
+        return
+    try:
+        import torch
+        st = torch.cuda.memory_stats(0)
+        # Pick informative fields
+        fields = [
+            ("allocated_bytes.all.current", "allocated"),
+            ("reserved_bytes.all.current", "reserved"),
+            ("active_bytes.all.current", "active"),
+            ("inactive_split_bytes.all.current", "inactive_split"),
+            ("segment.all.current", "segments"),
+            ("num_alloc_retries", "alloc_retries"),
+            ("num_ooms", "ooms"),
+        ]
+        parts = []
+        for k, label in fields:
+            v = st.get(k, 0)
+            if k.endswith("_bytes.all.current"):
+                parts.append(f"{label}={v/1024**2:.0f}MB")
+            else:
+                parts.append(f"{label}={v}")
+        import gc
+        gc.collect()
+        torch.cuda.synchronize(0)
+        free_b, tot_b = torch.cuda.mem_get_info(0)
+        parts.append(f"driver_free={free_b/1024**2:.0f}MB")
+        parts.append(f"driver_used={(tot_b-free_b)/1024**2:.0f}MB")
+        logger.info(f"[DIAG {tag}] {prev_model}->{target_model} | " + " ".join(parts))
+    except Exception as e:
+        logger.warning(f"[DIAG {tag}] failed: {e}")
+
+
 def do_model_switch_bump(
     scheduler: "Scheduler",
     target_model_path: str,
@@ -743,9 +863,23 @@ def do_model_switch_bump(
         f"Bump switch: {scheduler.server_args.model_path} -> {target_model_path}"
     )
     ctx = _build_context(scheduler, target_model_path, target_model_name)
+    _diag_cuda_mem("pre_switch", ctx.prev_model_name, ctx.target_model_name)
+    # Reset the total timer AFTER pre_switch probe so DIAG overhead (gc.collect +
+    # cuda.synchronize + mem_get_info ~50-100ms) is not counted in switch latency.
+    import time as _t
+    ctx.t_total_start = _t.perf_counter()
     _phase_1_save_and_teardown(ctx)
+    _diag_cuda_mem("after_phase1", ctx.prev_model_name, ctx.target_model_name)
     _phase_2_load_weights(ctx)
-    _phase_3_kv_cache(ctx)
-    _phase_4_runtime_and_graph(ctx)
+    from sglang.srt.utils.torch_memory_saver_adapter import set_per_model_tag_suffix as _set_suffix
+    _set_suffix(ctx.target_model_name)
+    try:
+        _phase_3_kv_cache(ctx)
+        _diag_cuda_mem("after_phase3", ctx.prev_model_name, ctx.target_model_name)
+        _phase_4_runtime_and_graph(ctx)
+        _diag_cuda_mem("after_phase4", ctx.prev_model_name, ctx.target_model_name)
+    finally:
+        _set_suffix("")
     _phase_5_finalize(ctx)
+    _diag_cuda_mem("post_switch", ctx.prev_model_name, ctx.target_model_name)
     return ctx.timings

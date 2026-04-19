@@ -181,6 +181,19 @@ class HostModelManager:
 
                 model.eval()
 
+                # Materialize non-persistent buffers (RoPE cos_sin_cache etc.) on CPU.
+                # Meta init leaves them with NULL data_ptr; a later switch would
+                # recompute them on GPU every time (~20ms). Compute once here so
+                # _finalize_model_on_gpu only needs a single .to(cuda) per switch.
+                for _m in model.modules():
+                    if hasattr(_m, "_compute_cos_sin_cache") and hasattr(_m, "cos_sin_cache"):
+                        try:
+                            _m.cos_sin_cache = _m._compute_cos_sin_cache().to(
+                                dtype=_m.cos_sin_cache.dtype
+                            )
+                        except Exception:
+                            pass
+
                 entry.cpu_model = model
                 entry.cpu_state_dict = dict(model.state_dict())
 

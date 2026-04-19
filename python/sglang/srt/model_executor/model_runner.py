@@ -624,7 +624,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(pre_model_load_memory)
+        # Wrap startup init with per-model tag suffix so Phase 1 pause (in switch)
+        # can precisely target this startup model's allocations later.
+        from sglang.srt.utils.torch_memory_saver_adapter import (
+            set_per_model_tag_suffix as _set_suffix,
+        )
+        _suffix_for_startup = getattr(
+            self.server_args, "served_model_name", ""
+        ) or ""
+        _set_suffix(_suffix_for_startup)
+        try:
+            self.init_memory_pool(pre_model_load_memory)
+        finally:
+            _set_suffix("")
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -652,18 +664,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
-        if self.device == "cuda" or self.device == "musa":
-            self.init_cublas()
-            self.init_attention_backend()
-            self.kernel_warmup()
-            self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
-            self.init_attention_backend()
-            self.init_device_graphs()
-        else:
-            self.graph_runner = None
-            self.graph_mem_usage = 0
-            self.init_attention_backend()
+        from sglang.srt.utils.torch_memory_saver_adapter import (
+            set_per_model_tag_suffix as _set_suffix,
+        )
+        _startup_suffix = getattr(self.server_args, "served_model_name", "") or ""
+        _set_suffix(_startup_suffix)
+        try:
+            if self.device == "cuda" or self.device == "musa":
+                self.init_cublas()
+                self.init_attention_backend()
+                self.kernel_warmup()
+                self.init_device_graphs()
+            elif self.device in ["npu", "cpu"]:
+                self.init_attention_backend()
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+                self.init_attention_backend()
+        finally:
+            _set_suffix("")
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
@@ -1268,8 +1288,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 module._buffers[parts[-1]] = torch.empty(
                     buf.shape, dtype=buf.dtype, device=self.device
                 )
+        # cos_sin_cache was materialized on CPU in host_model_manager.load;
+        # the cpu->cuda move is handled by the generic buffer loop above.
+        # Only fall back to recompute if the buffer is still meta (should not happen).
         for module in self.model.modules():
             if hasattr(module, "_compute_cos_sin_cache") and hasattr(module, "cos_sin_cache"):
+                if module.cos_sin_cache.device.type != "meta":
+                    continue
                 try:
                     cache = module._compute_cos_sin_cache().to(
                         device=self.device, dtype=module.cos_sin_cache.dtype

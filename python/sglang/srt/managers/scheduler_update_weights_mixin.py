@@ -292,11 +292,13 @@ class SchedulerUpdateWeightsMixin:
         finally:
             self._switch_queue.popleft()
             self._preload_attempted_target = None  # allow preload for next queued target
+            # Eagerly prime preload for the new queue[0] (next target) without
+            # waiting for the next event-loop tick. This keeps D2D hit-rate high
+            # across chains like A->B->C where each switch should overlap with
+            # the next targets preload.
+            self._check_preload()
 
     def _check_preload(self: "Scheduler"):
-        """Preload the next queued switch target in the background. Called from scheduler idle loop."""
-        # Fire-and-forget drain for background CPU-load notifications. Cheap
-        # O(1) when the queue is empty; each event emits one IPC.
         self._drain_cpu_ready_events()
 
         if not self._switch_queue:
@@ -305,21 +307,21 @@ class SchedulerUpdateWeightsMixin:
         if target == self.active_model_name:
             return
 
-        # Already preloading?
         if self._preload_thread is not None and self._preload_thread.is_alive():
+            logger.info(f"PRELOAD_SKIP target={target} reason=thread_alive")
             return
 
-        # Already preloaded for this target?
         if (self._preload_manager is not None
                 and self._preload_manager.model_name == target
                 and self._preload_manager.is_valid):
+            logger.info(f"PRELOAD_SKIP target={target} reason=already_valid")
             return
 
-        # Already attempted preload for this target (success or failure)?
-        # Reset only when target changes or switch completes.
         if self._preload_attempted_target == target:
+            logger.info(f"PRELOAD_SKIP target={target} reason=attempted")
             return
 
+        logger.info(f"PRELOAD_TRY target={target} active={self.active_model_name}")
         self._start_weight_preload(target)
 
     def register_model(self: "Scheduler", recv_req):
@@ -456,6 +458,7 @@ class SchedulerUpdateWeightsMixin:
                     kv_allocator.detach_staging()
             except Exception:
                 logger.exception("Preload thread error")
+                raise
             finally:
                 logger.debug(
                     f"Preload thread exiting for {target_model_name}, is_valid={preload_mgr.is_valid}"
