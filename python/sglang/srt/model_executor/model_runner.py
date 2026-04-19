@@ -1085,20 +1085,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         bump = self.vram_mgr
 
-        # Calculate total size
+        # Calculate total size.
+        #
+        # Region size MUST match the other weight-load paths (H2D fallback
+        # uses sum(cpu_sd.values()), D2D uses the same). If we sized it by
+        # `params + persistent` here, tied-weight models (OPT, Qwen) would
+        # end up with a smaller region at startup, `save_kv_pool` records
+        # that smaller size, the first switch-back enlarges the region, the
+        # weights_match check fails, and evict_graph + empty_cache crash.
+        sd = self.model.state_dict()
+        region_bytes = sum(
+            _align_up(v.numel() * v.element_size()) for v in sd.values()
+        )
+        # Also compute the unique-params total for the log, since migrate
+        # only writes each Parameter once.
         param_bytes = sum(_align_up(p.numel() * p.element_size()) for p in self.model.parameters())
-        sd_keys = set(self.model.state_dict().keys())
+        sd_keys = set(sd.keys())
         persistent_buf_bytes = sum(
             _align_up(b.numel() * b.element_size()) for n, b in self.model.named_buffers()
             if b is not None and b.numel() > 0 and n in sd_keys
         )
-        total_bytes = param_bytes + persistent_buf_bytes
-        logger.info(f"Bump: params={param_bytes / 1024**2:.1f} MB, "
-                    f"persistent_buffers={persistent_buf_bytes / 1024**2:.1f} MB, "
-                    f"total={total_bytes / 1024**2:.1f} MB")
+        used_bytes = param_bytes + persistent_buf_bytes
+        logger.info(
+            f"Bump: region={region_bytes / 1024**2:.1f} MB "
+            f"(used {used_bytes / 1024**2:.1f} MB = params {param_bytes / 1024**2:.1f} MB"
+            f" + persistent_buffers {persistent_buf_bytes / 1024**2:.1f} MB)"
+        )
 
         if not skip_region_alloc:
-            bump.reset_region("weights", total_bytes)
+            bump.reset_region("weights", region_bytes)
 
         # H2D parameters — rebind .data in-place to preserve wrapper attrs
         h2d_stream = torch.cuda.Stream()
@@ -1225,14 +1240,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise
 
     def _finalize_model_on_gpu(self):
-        """Move non-persistent buffers to GPU and recompute RoPE cache."""
+        """Move non-persistent buffers to GPU and recompute RoPE cache.
+
+        Bump path initialises the model under with torch.device("meta"),
+        so non-persistent buffers (RoPE cos_sin_cache, inv_freq etc.)
+        stay on the meta device with a NULL data pointer. Only moving
+        cpu→cuda leaves them meta; the attention RoPE kernel then
+        reads NULL and garbage values and K gets the wrong positional
+        encoding. Materialise every meta buffer on GPU, and for any module
+        that exposes _compute_cos_sin_cache recompute the RoPE cache
+        from scratch so it has real data.
+        """
         for name, buf in self.model.named_buffers():
-            if buf is not None and buf.device.type == "cpu":
+            if buf is None:
+                continue
+            if buf.device.type == "cpu":
                 parts = name.split(".")
                 module = self.model
                 for part in parts[:-1]:
                     module = getattr(module, part)
                 module._buffers[parts[-1]] = buf.to(self.device)
+            elif buf.device.type == "meta":
+                parts = name.split(".")
+                module = self.model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module._buffers[parts[-1]] = torch.empty(
+                    buf.shape, dtype=buf.dtype, device=self.device
+                )
+        for module in self.model.modules():
+            if hasattr(module, "_compute_cos_sin_cache") and hasattr(module, "cos_sin_cache"):
+                try:
+                    cache = module._compute_cos_sin_cache().to(
+                        device=self.device, dtype=module.cos_sin_cache.dtype
+                    )
+                    module.cos_sin_cache = cache
+                except Exception:
+                    logger.exception(
+                        f"Failed to recompute RoPE cache for {type(module).__name__}"
+                    )
         from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
         reserve_rope_cache_for_long_sequences(self.model, self.server_args, self.model_config)
 

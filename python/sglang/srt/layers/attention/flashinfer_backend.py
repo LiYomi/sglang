@@ -256,7 +256,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 for _ in range(self.num_wrappers)
             ]
-
         fmha_backend = "auto"
         if is_sm100_supported():
             # Disable CUTLASS backend when piecewise cuda graph is enabled
@@ -302,7 +301,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
-
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(

@@ -409,20 +409,20 @@ def _load_via_h2d_fallback(ctx: _SwitchContext, cpu_model, cpu_sd) -> None:
         f"  FALLBACK: full H2D load for {ctx.target_model_name}, "
         f"cpu_model={cpu_model is not None}, staging={ctx.has_staging}"
     )
-    if cpu_model is not None:
-        param_bytes = sum(
-            _align_up(p.numel() * p.element_size()) for p in cpu_model.parameters()
-        )
-        sd_keys = set(cpu_model.state_dict().keys())
-        buf_bytes = sum(
-            _align_up(b.numel() * b.element_size())
-            for n, b in cpu_model.named_buffers()
-            if b is not None and b.numel() > 0 and n in sd_keys
-        )
-        total_weight_bytes = param_bytes + buf_bytes
-    elif cpu_sd is not None:
+    # Must match _load_via_d2d's `needed_bytes = sum(cpu_sd.values())`.
+    # Otherwise tied-weight models (OPT-125m's lm_head) get a smaller H2D
+    # region than D2D, `save_kv_pool(weight_bytes)` records the smaller
+    # number, and the next D2D round-trip's weights_match check fails,
+    # dropping into _kv_rebuild + evict_graph whose empty_cache then
+    # trips on stale pytorch blocks.
+    if cpu_sd is not None:
         total_weight_bytes = sum(
             _align_up(v.numel() * v.element_size()) for v in cpu_sd.values()
+        )
+    elif cpu_model is not None:
+        total_weight_bytes = sum(
+            _align_up(v.numel() * v.element_size())
+            for v in cpu_model.state_dict().values()
         )
     else:
         total_weight_bytes = 0
@@ -589,9 +589,18 @@ def _phase_2_load_weights(ctx: _SwitchContext) -> None:
         preload_mgr.verify_integrity()
         logger.info(f"  verify_integrity: {(time.perf_counter()-t_verify)*1000:.1f}ms")
 
-    # 2b. Update runner's model config
+    # 2b. Update runner's model config.
+    #
+    # served_model_name must be updated here (not in Phase 5 finalize):
+    # `memory_saver_adapter.cuda_graph(tag=f"cuda_graph:{served_model_name}")`
+    # runs in Phase 4 and tags every captured allocation. If we wait until
+    # finalize, new graph allocs land under the *previous* model's tag,
+    # mixing PAUSED and ACTIVE entries for that tag and crashing the next
+    # save_graph/resume cycle with "Cannot resume allocation that is not
+    # paused".
     t_config = time.perf_counter()
     ctx.runner.server_args.model_path = ctx.target_model_path
+    ctx.scheduler.server_args.served_model_name = ctx.target_model_name
     new_config = ModelConfig.from_server_args(
         ctx.runner.server_args, model_path=ctx.target_model_path
     )
@@ -666,13 +675,36 @@ def _phase_3_kv_cache(ctx: _SwitchContext) -> None:
 
 
 def _phase_4_runtime_and_graph(ctx: _SwitchContext) -> None:
-    """Rebuild attention backend; restore-or-recapture CUDA graphs."""
+    """Rebuild attention backend; restore-or-recapture CUDA graphs.
+
+    When the KV pool hit AND the graph cache holds the target model, skip
+    the ~140ms `init_attention_backend` (B200 CUTLASS FlashInfer wrapper
+    construction) and restore attn_backend + graph_runner straight from
+    the cache in a single pass.
+    """
     t0 = time.perf_counter()
 
-    ctx.runner.init_attention_backend()
-    clear_forward_input_buffer_pool()
-    if not ctx.scheduler.server_args.disable_cuda_graph:
-        _recapture_graphs(ctx)
+    graph_cache_has = (
+        not ctx.scheduler.server_args.disable_cuda_graph
+        and ctx.kv_hit
+        and ctx.target_model_name in ctx.resource_cache.graph_cache
+    )
+
+    if graph_cache_has:
+        graph_hit = ctx.resource_cache.restore_graph(
+            ctx.runner,
+            ctx.target_model_name,
+            memory_saver_adapter=ctx.memory_saver,
+        )
+        if not graph_hit:
+            ctx.runner.init_attention_backend()
+            clear_forward_input_buffer_pool()
+            _recapture_graphs(ctx)
+    else:
+        ctx.runner.init_attention_backend()
+        clear_forward_input_buffer_pool()
+        if not ctx.scheduler.server_args.disable_cuda_graph:
+            _recapture_graphs(ctx)
 
     ctx.timings["runtime_graph"] = time.perf_counter() - t0
     logger.info(f"  runtime_graph: {ctx.timings['runtime_graph']*1000:.1f}ms")

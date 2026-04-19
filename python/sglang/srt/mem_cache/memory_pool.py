@@ -851,9 +851,11 @@ class MHATokenToKVPool(KVCache):
             k_shape = (self.size + self.page_size, self.head_num, self.head_dim)
             v_shape = (self.size + self.page_size, self.head_num, self.v_head_dim)
             elem_size = self.store_dtype.itemsize
-            # Align each per-layer buffer before summing so the reserved
-            # region matches what `create_tensor` will actually consume (it
-            # aligns every allocation up to 256 bytes).
+            # Align each per-layer k/v before summing — `create_tensor`
+            # aligns every allocation to 256B internally, and models with
+            # many layers accumulate enough padding that the raw sum trips
+            # `sub-alloc OOM` by a few KB (SmolLM2 32 layers hit this).
+            # `-= (ws+buf)` slack in profile_max_num_token covers the gap.
             k_bytes = _align_up(prod(k_shape) * elem_size)
             v_bytes = _align_up(prod(v_shape) * elem_size)
             total_kv_bytes = (k_bytes + v_bytes) * self.layer_num

@@ -142,13 +142,32 @@ class HostModelManager:
                         total_bytes, dtype=torch.uint8, pin_memory=True
                     )
                     offset = 0
-                    for pname, p in model.named_parameters():
+                    for pname, p in list(model.named_parameters()):
                         nbytes = p.numel() * p.element_size()
-                        p.data = (
+                        view = (
                             pin_buf[offset : offset + nbytes]
                             .view(p.dtype)
                             .reshape(p.shape)
                         )
+                        # Meta Parameter → CPU view: `p.data = view` raises
+                        # "incompatible tensor type" (meta vs cpu TensorImpl).
+                        # Replace the whole Parameter instead. Safe here because
+                        # _initialize_model has not yet attached quant/LoRA
+                        # wrapper attrs (those arrive via load_weights_and_postprocess
+                        # that runs below). If quant support is added, rehydrate
+                        # wrapper attrs here before continuing.
+                        parent_name, _, attr_name = pname.rpartition(".")
+                        parent = model.get_submodule(parent_name) if parent_name else model
+                        new_param = torch.nn.Parameter(view, requires_grad=False)
+                        # Carry over attrs sglang models pin on Parameter
+                        # (`weight_loader`, `output_dim`, shard metadata, etc.).
+                        # These live in Tensor.__dict__; a fresh Parameter
+                        # starts empty and load_weights would blow up.
+                        try:
+                            new_param.__dict__.update(p.__dict__)
+                        except Exception:
+                            pass
+                        parent._parameters[attr_name] = new_param
                         offset += _align_up(nbytes)
                     model._pinned_weight_buffer = pin_buf
 

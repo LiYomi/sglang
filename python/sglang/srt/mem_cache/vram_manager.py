@@ -209,11 +209,6 @@ class ModelResourceCache:
                     if b is not None and b.device.type == "cuda" and b.numel() > 0:
                         saved_buffers[n] = b
 
-            # Pause VMM BEFORE writing cache: on failure, nothing to roll back.
-            if memory_saver_adapter is not None and memory_saver_adapter.enabled:
-                memory_saver_adapter.pause(vmm_tag)
-                logger.debug(f"  VMM: paused graph pool tag={vmm_tag}")
-
             self.graph_cache[model_name] = {
                 "vmm_graph_tag": vmm_tag,
                 "graph_runner": runner.graph_runner,
@@ -228,6 +223,9 @@ class ModelResourceCache:
                 "graph_pool_handle": _get_graph_pool(),
                 "model_buffers": saved_buffers,
             }
+            if memory_saver_adapter is not None and memory_saver_adapter.enabled:
+                memory_saver_adapter.pause(vmm_tag)
+                logger.debug(f"  VMM: paused graph pool tag={vmm_tag}")
             logger.info(f"  Graph cache saved for {model_name}")
         except Exception as e:
             logger.warning(f"  Graph cache save failed: {e}")
@@ -252,8 +250,6 @@ class ModelResourceCache:
             saved_pool = cached.get("graph_pool_handle")
             if saved_pool is not None:
                 _set_graph_pool(saved_pool)
-                # Keep pynccl_allocator's id in sync with the restored pool.
-                _set_graph_pool_id(saved_pool)
             runner.attn_backend = cached["attn_backend"]
 
             for attr in ("attention_layers", "moe_layers", "moe_fusions"):
@@ -328,7 +324,6 @@ class ModelResourceCache:
                         logger.warning(
                             f"  Skip restore buffer {buf_name}: path lookup failed ({e})"
                         )
-
             logger.info(f"  Graph cache restored for {model_name}")
             return True
         except Exception as e:
@@ -337,27 +332,20 @@ class ModelResourceCache:
             return False
 
     def evict_graph(self, model_name: str, memory_saver_adapter=None):
-        """Evict stale graph cache and release VMM physical pages.
+        """Evict stale graph cache without resuming its VMM pages.
 
-        Resume runs BEFORE popping: if resume fails we keep the cache entry
-        so the caller can retry, avoiding a silent tag leak.
+        The cached graph is about to be discarded and recaptured fresh,
+        so we only drop the bookkeeping. Resuming the VMM tag would
+        remap pages that pytorch's caching allocator already believes
+        were freed, and the subsequent `empty_cache` in
+        `init_device_graphs` hits them with invalid-argument errors.
+        The paused pages remain reclaimable by the CUDA driver; the next
+        capture will allocate fresh pages under a new tag.
         """
-        stale = self.graph_cache.get(model_name)
+        stale = self.graph_cache.pop(model_name, None)
         if stale is None:
             return
-        if memory_saver_adapter is not None and memory_saver_adapter.enabled:
-            vmm_tag = stale.get("vmm_graph_tag")
-            if vmm_tag:
-                try:
-                    memory_saver_adapter.resume(vmm_tag)
-                except Exception as e:
-                    logger.warning(
-                        f"  VMM resume failed for stale graph '{vmm_tag}': {e}; "
-                        f"keeping cache entry for retry"
-                    )
-                    return
-        self.graph_cache.pop(model_name, None)
-        logger.info(f"  Graph cache evicted: {model_name}")
+        logger.info(f"  Graph cache evicted: {model_name} (VMM tag left paused)")
 
     def save_kv_pool(self, model_name: str, runner, bump):
         """Save KV pool state for fast switch-back."""

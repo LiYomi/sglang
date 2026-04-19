@@ -592,9 +592,11 @@ class PreloadManager:
         d2d_stream.synchronize()
         h2d_stream.synchronize()
 
-        # Drop block tensors now: the KV region they alias will be released
-        # right after the switch, which would otherwise leave dangling pointers.
-        self._block_tensors = []
+        # Staging has been consumed. Drop the whole session state so the
+        # next switch re-runs preload cleanly. Only clearing _block_tensors
+        # leaves scatter_info non-None, which makes is_valid still report
+        # True and tricks _check_preload into skipping the next preload.
+        self._reset_session()
 
         return d2d_bytes, h2d_bytes
 

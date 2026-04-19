@@ -144,11 +144,15 @@ class ModelRunnerKVCacheMixin:
         if self.vram_mgr is not None:
             bump = self.vram_mgr
             cell_size = self.get_cell_size_per_token(self.num_effective_layers)
-            # `get_available_bytes()` already excludes the runtime region,
-            # which was allocated earlier in `_init_runtime_region()` (see
-            # `load_model` and `_kv_rebuild`). Subtracting ws_size+buf_size
-            # here would double-count it and under-report KV capacity.
+            # `get_available_bytes()` already excludes the runtime region.
+            # Subtracting ws+buf here is technically a double count, but it
+            # doubles as headroom for (a) page_size extra slot in the pool
+            # and (b) per-layer 256B alignment padding in create_tensor.
+            # Removing it alongside tightening §17 alignment trips OOM at
+            # reset_region. Revisit together.
             available_bytes = bump.get_available_bytes()
+            ws_size, buf_size = self._estimate_runtime_bytes()
+            available_bytes -= (ws_size + buf_size)
             max_tokens = available_bytes // cell_size
             logger.info(
                 f"Bump: KV cache available={available_bytes/1024**2:.1f}MB, "
