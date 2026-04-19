@@ -750,9 +750,18 @@ class Scheduler(
         return self._preload_manager
 
     def wait_for_preload(self) -> None:
-        """Block until any in-flight weight preload thread has finished."""
+        """Stop the preload thread at its next chunk boundary, then join.
+
+        Instead of waiting for the full H2D staging to finish, ask the preload
+        loop to stop early so a switch can consume already-completed chunks via
+        partial D2D. Chunks still in-flight will be filled by the H2D fallback
+        path inside gather_to_bump, running on a separate stream in parallel.
+        """
         thread = self._preload_thread
         if thread is not None and thread.is_alive():
+            mgr = self._preload_manager
+            if mgr is not None:
+                mgr.request_stop()
             thread.join()
 
     def init_cache_with_memory_pool(self):
@@ -1340,6 +1349,12 @@ class Scheduler(
                 self.cancel_bubble_timer()
                 continue
 
+            # Start preload as early as possible so even an immediately-firing
+            # switch below has a chance to consume partial staging via D2D.
+            # The trailing _check_preload() at the end of the loop is kept for
+            # the standard "active busy, prime next" case.
+            self._check_preload()
+
             # Execute deferred model switch before scheduling new batches
             self._execute_pending_switch()
 
@@ -1380,6 +1395,11 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # Start preload as early as possible so even an immediately-firing
+            # switch below has a chance to consume partial staging via D2D.
+            # The trailing _check_preload() is kept for the standard prime-next case.
+            self._check_preload()
 
             # Get the next batch to run
             # Execute deferred model switch before scheduling new batches

@@ -111,6 +111,18 @@ class PreloadManager:
         self._staging_start: int = 0
         self._staging_end: int = 0
         self._chunk_rows: int = 0
+        # Graceful-stop flag checked at each chunk boundary in _h2d_scatter.
+        # Set by request_stop() when a switch wants to use the already-staged
+        # chunks via partial D2D rather than wait for the full preload.
+        self._stop_requested: bool = False
+
+    def request_stop(self) -> None:
+        """Ask the preload loop to stop at the next chunk boundary.
+
+        Chunks already published in scatter_info.chunk_valid stay valid and
+        can be consumed by gather_to_bump; unstaged chunks fall back to H2D.
+        """
+        self._stop_requested = True
 
     def mark_dirty_pages(self, allocated_pages: torch.Tensor):
         """Mark every staging chunk that overlaps the newly-allocated rows.
@@ -199,6 +211,24 @@ class PreloadManager:
         self._staging_end = staging_start + staging_rows
         self._chunk_rows = chunk_rows
 
+        # Publish scatter_info *before* the H2D scatter runs so a switch that
+        # cuts in mid-preload can read already-staged chunks via chunk_valid.
+        # chunk_valid[i] flips to True inside _h2d_scatter after each chunk
+        # has been event-synchronized on h2d_stream.
+        self._stop_requested = False
+        self.scatter_info = ScatterStagingInfo(
+            staging_start=staging_start,
+            staging_rows=staging_rows,
+            staged_per_block=staged_per_block,
+            num_blocks=num_blocks,
+            total_staged_bytes=0,
+            row_size=row_size,
+            pool_size=pool_size,
+            chunk_rows=chunk_rows,
+            unsafe_blocks=unsafe_blocks,
+            chunk_valid=[False] * num_chunks,
+        )
+
         total_written = self._h2d_scatter(
             safe_blocks,
             cpu_state_dict,
@@ -214,17 +244,9 @@ class PreloadManager:
             f"  TIMING: h2d_scatter={_scatter_ms:.0f}ms written={total_written/1024**2:.0f}MB"
         )
 
-        self.scatter_info = ScatterStagingInfo(
-            staging_start=staging_start,
-            staging_rows=staging_rows,
-            staged_per_block=staged_per_block,
-            num_blocks=num_blocks,
-            total_staged_bytes=total_written,
-            row_size=row_size,
-            pool_size=pool_size,
-            chunk_rows=chunk_rows,
-            unsafe_blocks=unsafe_blocks,
-        )
+        # Update final total (chunk_valid was updated chunk-by-chunk inside scatter)
+        if self.scatter_info is not None:
+            self.scatter_info.total_staged_bytes = total_written
 
         logger.debug(
             f"Preload: {model_name}, "
@@ -412,8 +434,15 @@ class PreloadManager:
         written_per_block = 0
         chunk_end = staging_start + staging_rows - 1
 
+        # First iter writes the leftover rows at the right edge so each iter
+        # aligns 1:1 with a gather-chunk (iter k ↔ gather-chunk num_chunks-1-k).
+        # leftover = staging_rows mod chunk_rows, falls back to chunk_rows when
+        # staging_rows is an exact multiple.
+        leftover_rows = staging_rows % chunk_rows or chunk_rows
+
         while chunk_end >= staging_start and written_per_block < staged_per_block:
-            actual_rows = min(chunk_rows, chunk_end - staging_start + 1)
+            iter_rows = leftover_rows if written_per_block == 0 else chunk_rows
+            actual_rows = min(iter_rows, chunk_end - staging_start + 1)
             chunk_start_row = chunk_end - actual_rows + 1
             chunk_bytes = min(
                 actual_rows * row_size, staged_per_block - written_per_block
@@ -486,6 +515,13 @@ class PreloadManager:
             else:
                 guard = contextlib.nullcontext()
 
+            if self._stop_requested:
+                logger.info(
+                    f"    H2D scatter stopped by caller at chunk {ci}/{len(chunk_ops_list)} "
+                    f"(staged {total_written/1024**2:.0f}MB)"
+                )
+                break
+
             with guard:
                 if ops:
                     _batch_h2d.dispatch(ops, stream_ptr)
@@ -495,6 +531,17 @@ class PreloadManager:
                 event.synchronize()
 
             total_written += chunk_written
+
+            # Publish this chunk completion. With the leftover-first layout
+            # above, each iter writes exactly one gather-chunk: iter k covers
+            # rows [ci*chunk_rows, (ci+1)*chunk_rows) for ci = num_chunks-1-k,
+            # so floor division gives the right index directly.
+            # event.synchronize() above guarantees the H2D bytes are committed
+            # to GPU memory before the bit flips to True.
+            si = self.scatter_info
+            ci_arr = (chunk_start_row - staging_start) // chunk_rows
+            si.chunk_valid[ci_arr] = True
+            si.total_staged_bytes = total_written
 
         _dispatch_ms = (_time_h2d.perf_counter() - _t_dispatch) * 1000
         logger.debug(f"    H2D dispatch+sync: {_dispatch_ms:.0f}ms")
@@ -634,17 +681,23 @@ class PreloadManager:
     # ------------------------------------------------------------------
 
     def verify_integrity(self):
-        """Check which staging chunks are still valid using dirty flags."""
-        if self.scatter_info is None:
+        """Finalize chunk_valid: chunk is valid only if H2D finished AND not dirty.
+
+        _h2d_scatter sets chunk_valid[i]=True for chunks whose H2D completed.
+        This AND-merges the dirty flag: if KV cache allocated into the chunk,
+        flip it back to False so gather_to_bump falls back to H2D for it.
+        """
+        si = self.scatter_info
+        if si is None or si.chunk_valid is None:
             return
 
-        si = self.scatter_info
+        num_chunks = len(si.chunk_valid)
+        for i in range(num_chunks):
+            if self._chunk_dirty[i]:
+                si.chunk_valid[i] = False
+        n_corrupted = sum(1 for v in si.chunk_valid if not v)
         chunk_rows = si.chunk_rows
-        num_chunks = math.ceil(si.staging_rows / chunk_rows)
-
-        chunk_valid = [not d for d in self._chunk_dirty]
-        si.chunk_valid = chunk_valid
-        n_corrupted = sum(1 for v in chunk_valid if not v)
+        chunk_valid = si.chunk_valid
 
         if n_corrupted == 0:
             logger.debug(
