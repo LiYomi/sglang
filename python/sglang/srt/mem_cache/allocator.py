@@ -210,16 +210,21 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if self._preload_mgr is not None:
                 self._preload_mgr.mark_dirty_pages(select_index)
             if self._lifo_mode:
-                # CPU-side proxy for `max slot index ever allocated`:
-                # LIFO puts freed slots back at the front of free_pages, so
-                # the only time alloc dips into indices beyond the previous
-                # peak is when total live allocations exceed that peak. Use
-                # the live count (size - |free_pages|) as the bound and skip
-                # the GPU→CPU sync that `select_index.max().item()` caused on
-                # every alloc.
+                # Live count proxy: in canonical LIFO layout (freed-low at
+                # front, pristine-high at tail) `live == max allocated index`.
                 live = self.size - len(self.free_pages)
                 if live > self._high_water_mark:
                     self._high_water_mark = live
+                # Reserved-range alloc reorders free_pages (repacking
+                # `available_remainder + reserved`), leaving high pristine
+                # slots at the front. In that one alloc the invariant breaks
+                # and live count alone can miss indices beyond it. Pay the
+                # GPU->CPU sync only for these reserved allocs (staging
+                # windows, a handful per switch) to absorb the true max.
+                if self._reserved_range is not None:
+                    peak = int(select_index.max().item())
+                    if peak > self._high_water_mark:
+                        self._high_water_mark = peak
             return select_index
         finally:
             if _lk:

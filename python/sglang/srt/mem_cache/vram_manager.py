@@ -8,6 +8,7 @@ ModelResourceCache: CUDA graph / KV pool cache per model
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from math import prod
 from typing import Dict
@@ -251,6 +252,17 @@ class ModelResourceCache:
             if saved_pool is not None:
                 _set_graph_pool(saved_pool)
             runner.attn_backend = cached["attn_backend"]
+
+            # keep module-level global_workspace_buffer in sync with
+            # the restored backend. teardown cleared it to None; without this
+            # sync any non-replay path (eager fallback / new wrapper / spec
+            # draft) would read None and allocate a parallel workspace that
+            # diverges from the cached backend.workspace_buffer.
+            _ws = getattr(runner.attn_backend, "workspace_buffer", None)
+            if _ws is not None:
+                _mod = sys.modules.get(type(runner.attn_backend).__module__)
+                if _mod is not None and hasattr(_mod, "global_workspace_buffer"):
+                    _mod.global_workspace_buffer = _ws
 
             for attr in ("attention_layers", "moe_layers", "moe_fusions"):
                 saved_val = cached.get(attr)

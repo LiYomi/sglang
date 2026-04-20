@@ -494,7 +494,10 @@ class PreloadManager:
         for ci, ((ops, chunk_written), chunk_start_row) in enumerate(
             zip(chunk_ops_list, chunk_row_ranges)
         ):
-            # Check if KVC already allocated into this chunk — if so, stop.
+            # Fast path: bail early if this chunk was already dirtied before
+            # we get here. The authoritative check happens again inside the
+            # lock below; this just avoids acquiring the lock when we already
+            # know we will have to skip.
             # KVC grows left-to-right, staging goes right-to-left, so hitting
             # a dirty chunk means all remaining (lower) chunks are unsafe too.
             dirty_idx = (chunk_start_row - staging_start) // chunk_rows
@@ -505,8 +508,10 @@ class PreloadManager:
                 break
 
             # Reserve current chunk rows + hold staging lock around dispatch+sync.
-            # Without the lock, main-thread alloc can read reserved_range=None,
-            # pick rows in this chunk's range, then our H2D would overwrite KV data.
+            # alloc also takes this lock before touching free_pages and
+            # mark_dirty_pages, so once we hold it the chunk's dirty flag is
+            # stable and we cannot race with a concurrent alloc landing in
+            # this chunk's row range.
             if allocator_ref is not None:
                 chunk_end_row = min(
                     chunk_start_row + chunk_rows, staging_start + staging_rows
@@ -523,6 +528,20 @@ class PreloadManager:
                 break
 
             with guard:
+                # Re-check dirty inside the lock. alloc may have flipped the
+                # flag between the fast path above and us acquiring the lock;
+                # without this re-check the H2D below would overwrite a
+                # freshly-allocated KV slot.
+                if (
+                    0 <= dirty_idx < len(self._chunk_dirty)
+                    and self._chunk_dirty[dirty_idx]
+                ):
+                    logger.info(
+                        f"    H2D stopped (lock re-check): chunk {ci} "
+                        f"(rows {chunk_start_row}+) dirty, KVC boundary reached"
+                    )
+                    break
+
                 if ops:
                     _batch_h2d.dispatch(ops, stream_ptr)
 

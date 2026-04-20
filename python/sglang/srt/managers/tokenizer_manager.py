@@ -533,10 +533,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            # Multi-model: gate on readiness (tokenizer + detokenizer + cpu all
-            # loaded) so we never tokenize something that can't later be
-            # decoded or served. Clients are expected to poll GET /v1/models
-            # before sending requests; this is the hard safety check.
+            # Readiness gate: when a model_name is given it must be fully
+            # loaded (tokenizer + detokenizer + cpu) before we tokenize.
+            # When model_name is None (single-model mode / internal warmup
+            # requests) we fall back to `self.tokenizer`, which is set once
+            # in __init__ and never mutated afterward — safe under concurrent
+            # access without locking.
             model_name = obj.model_name
             if model_name:
                 if not self.model_is_ready(model_name):
@@ -550,16 +552,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         f"Model '{model_name}' not ready (status={status}). "
                         f"Poll GET /v1/models until ready before sending requests."
                     )
-                # Snapshot the per-request tokenizer into a local so downstream
-                # await points can't have it swapped under us by a concurrent
-                # request for a different model.
-                request_tokenizer = self.model_tokenizers[model_name]
-            else:
-                request_tokenizer = self.tokenizer
-            # Keep self.tokenizer pointing at the current request's tokenizer
-            # for legacy callers (logger, default paths) that still read it
-            # directly. New code should prefer request_tokenizer.
-            self.tokenizer = request_tokenizer
+            # Downstream looks up the tokenizer via `obj.model_name`; missing
+            # model_name resolves to `self.tokenizer` (default).
 
             await self._validate_and_resolve_lora(obj)
 
@@ -633,7 +627,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         return input_ids, token_type_ids
 
     async def _tokenize_texts(
-        self, texts: Union[str, List[str]], is_cross_encoder: bool = False
+        self,
+        texts: Union[str, List[str]],
+        is_cross_encoder: bool = False,
+        tokenizer: Any = None,
     ) -> Union[
         Tuple[List[int], Optional[List[int]]],
         Tuple[List[List[int]], Optional[List[List[int]]]],
@@ -670,7 +667,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             Note: token_type_ids is None unless is_cross_encoder=True.
         """
-        if not texts or self.tokenizer is None:
+        # Prefer caller-provided per-request tokenizer; fall back to default.
+        if tokenizer is None:
+            tokenizer = self.tokenizer
+        if not texts or tokenizer is None:
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
         # Step 1: Detect input format and prepare for tokenization
@@ -703,7 +703,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
-            encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+            encoded = tokenizer(tokenizer_input, **tokenizer_kwargs)
             input_ids = encoded["input_ids"]
             token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
 
@@ -717,6 +717,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        # Resolve per-request tokenizer from obj.model_name. generate_request
+        # already rejects model_name=None; internal direct callers
+        # (engine.generate single-model mode) fall back to the default.
+        _req_tokenizer = (
+            self.model_tokenizers.get(obj.model_name, self.tokenizer)
+            if obj.model_name
+            else self.tokenizer
+        )
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -736,7 +744,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
         else:
-            if self.tokenizer is None:
+            if _req_tokenizer is None:
                 raise ValueError(
                     "The engine initialized with skip_tokenizer_init=True cannot "
                     "accept text prompts. Please provide input_ids or re-initialize "
@@ -750,7 +758,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 input_ids = []
             else:
                 input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
+                    input_text, is_cross_encoder_request, tokenizer=_req_tokenizer
                 )
 
         if self.mm_processor and obj.contains_mm_input():
@@ -981,6 +989,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        # Resolve per-request tokenizer from obj.model_name; fall back to default.
+        _req_tokenizer = (
+            self.model_tokenizers.get(obj.model_name, self.tokenizer)
+            if obj.model_name
+            else self.tokenizer
+        )
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -989,7 +1003,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             sampling_kwargs = obj.sampling_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
+        sampling_params.normalize(_req_tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
         # Build return object
@@ -1757,6 +1771,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
     ):
+        # Resolve per-request tokenizer via state.obj.model_name so the recv
+        # loop decodes each rid with its own model's tokenizer.
+        _tok_model = getattr(state.obj, "model_name", None)
+        _req_tokenizer = (
+            self.model_tokenizers.get(_tok_model, self.tokenizer)
+            if _tok_model
+            else self.tokenizer
+        )
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
             state.input_token_logprobs.extend(
@@ -1764,6 +1786,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     state.input_token_logprobs_val[len(state.input_token_logprobs) :],
                     state.input_token_logprobs_idx[len(state.input_token_logprobs) :],
                     return_text_in_logprobs,
+                    tokenizer=_req_tokenizer,
                 )
             )
 
@@ -1773,6 +1796,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     state.output_token_logprobs_val[len(state.output_token_logprobs) :],
                     state.output_token_logprobs_idx[len(state.output_token_logprobs) :],
                     return_text_in_logprobs,
+                    tokenizer=_req_tokenizer,
                 )
             )
 
@@ -1788,6 +1812,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         state.input_top_logprobs_val[len(state.input_top_logprobs) :],
                         state.input_top_logprobs_idx[len(state.input_top_logprobs) :],
                         return_text_in_logprobs,
+                        tokenizer=_req_tokenizer,
                     )
                 )
             if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
@@ -1796,6 +1821,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         state.output_top_logprobs_val[len(state.output_top_logprobs) :],
                         state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
                         return_text_in_logprobs,
+                        tokenizer=_req_tokenizer,
                     )
                 )
 
@@ -1816,6 +1842,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             len(state.input_token_ids_logprobs) :
                         ],
                         return_text_in_logprobs,
+                        tokenizer=_req_tokenizer,
                     )
                 )
             if len(state.output_token_ids_logprobs_val) > len(
@@ -1830,6 +1857,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             len(state.output_token_ids_logprobs) :
                         ],
                         return_text_in_logprobs,
+                        tokenizer=_req_tokenizer,
                     )
                 )
 
@@ -1909,6 +1937,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
         decode_to_text: bool,
+        tokenizer: Any = None,
     ):
         if not decode_to_text:
             return [
@@ -1916,10 +1945,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
             ]
         else:
-            assert self.tokenizer is not None
+            # Prefer caller-provided per-request tokenizer; default falls back.
+            if tokenizer is None:
+                tokenizer = self.tokenizer
+            assert tokenizer is not None
             # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
             # into one string. Wrap each ID in its own list so they decode separately.
-            token_texts = self.tokenizer.batch_decode(
+            token_texts = tokenizer.batch_decode(
                 [[idx] for idx in token_logprobs_idx]
             )
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
@@ -1929,6 +1961,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
         decode_to_text: bool,
+        tokenizer: Any = None,
     ):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
@@ -1937,7 +1970,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if token_logprobs_val[i]:
                 ret.append(
                     self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text,
+                        tokenizer=tokenizer,
                     )
                 )
             else:
